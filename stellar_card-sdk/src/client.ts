@@ -989,6 +989,9 @@ export class Stellar_CardClient {
   ): Promise<import('./stellar').XlmEstimateResult> {
     const { estimateXlmRequired } = await import('./stellar');
     return estimateXlmRequired(usdcAmount, options);
+  }
+
+  /**
    * Fetch XLM, USDC and every trustline balance for a Stellar account in a
    * single Horizon call (#701). Unfunded accounts resolve to zero balances.
    * Results are cached for 3 seconds.
@@ -1006,4 +1009,3 @@ export class Stellar_CardClient {
     return getAccountBalances(publicKey, passphrase);
   }
 }
-
