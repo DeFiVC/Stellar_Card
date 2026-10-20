@@ -42,6 +42,8 @@ export {
   payViaContract,
   purchaseCard,
   estimateXlmRequired,
+  isValidStellarAddress,
+  resolveFederationAddress,
   signMessage,
   verifyMessage,
   // Re-export from this barrel to keep external imports stable even if
@@ -58,6 +60,7 @@ export type {
   PayOpts,
   EstimateXlmOptions,
   XlmEstimateResult,
+  FederationAddressResolution,
   Sep7PayParams,
   Sep7TxParams,
   Sep7ParsedUri,
@@ -188,7 +191,6 @@ export {
   TESTNET_USDC_SAC,
 } from './config';
 export type { Stellar_CardConfig, NetworkDetectionOptions, DetectedNetworkConfig } from './config';
-
 
 export {
   paginate,
