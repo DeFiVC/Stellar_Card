@@ -5,7 +5,15 @@
 import * as crypto from 'crypto';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  ListResourceTemplatesRequestSchema,
+  ReadResourceRequestSchema,
+  SubscribeRequestSchema,
+  UnsubscribeRequestSchema,
+  McpError,
+} from '@modelcontextprotocol/sdk/types.js';
 import {
   createOWSWallet,
   getOWSPublicKey,
@@ -14,6 +22,7 @@ import {
   purchaseCardOWS,
 } from './ows';
 import { Stellar_CardClient } from './client';
+import { Stellar_CardError } from './errors';
 // Audit A-38: version string imported from package.json instead of hardcoded.
 // The `with { type: 'json' }` import lets tsc emit a real assertion and
 // bun/node24 load it as JSON.
@@ -25,6 +34,100 @@ const BASE_URL = process.env.CARDS402_BASE_URL ?? 'https://api.stellar_card.com/
 const OWS_WALLET_NAME = process.env.OWS_WALLET_NAME ?? '';
 const OWS_WALLET_PASSPHRASE = process.env.OWS_WALLET_PASSPHRASE ?? undefined;
 const OWS_VAULT_PATH = process.env.OWS_VAULT_PATH ?? undefined;
+
+const ORDER_RESOURCE_TEMPLATE = 'stellar-card://orders/{orderId}';
+const MCP_RESOURCE_NOT_FOUND = -32002;
+
+interface OrderResourceSubscription {
+  timer: ReturnType<typeof setInterval>;
+  snapshot: string;
+  refreshing: boolean;
+}
+
+/** Serves JSON order snapshots and emits resource-updated notifications while subscribed. */
+export class OrderResourceProvider {
+  private readonly subscriptions = new Map<string, OrderResourceSubscription>();
+
+  constructor(
+    private readonly client: Pick<Stellar_CardClient, 'getOrder'>,
+    private readonly onUpdated: (uri: string) => Promise<void>,
+    private readonly pollIntervalMs = 3000,
+  ) {}
+
+  async read(uri: string) {
+    const orderId = this.orderIdFromUri(uri);
+    try {
+      const order = await this.client.getOrder(orderId);
+      return {
+        contents: [{ uri, mimeType: 'application/json', text: JSON.stringify(order) }],
+      };
+    } catch (error) {
+      if (error instanceof Stellar_CardError && error.status === 404) {
+        throw new McpError(MCP_RESOURCE_NOT_FOUND, `Order resource not found: ${uri}`);
+      }
+      throw error;
+    }
+  }
+
+  async subscribe(uri: string): Promise<void> {
+    if (this.subscriptions.has(uri)) return;
+
+    const initial = await this.read(uri);
+    const subscription: OrderResourceSubscription = {
+      timer: setInterval(() => void this.refresh(uri), this.pollIntervalMs),
+      snapshot: initial.contents[0]!.text,
+      refreshing: false,
+    };
+    this.subscriptions.set(uri, subscription);
+  }
+
+  unsubscribe(uri: string): void {
+    const subscription = this.subscriptions.get(uri);
+    if (!subscription) return;
+
+    clearInterval(subscription.timer);
+    this.subscriptions.delete(uri);
+  }
+
+  private orderIdFromUri(uri: string): string {
+    const match = /^stellar-card:\/\/orders\/([^/]+)$/.exec(uri);
+    if (!match) throw new McpError(MCP_RESOURCE_NOT_FOUND, `Order resource not found: ${uri}`);
+
+    try {
+      return decodeURIComponent(match[1]!);
+    } catch {
+      throw new McpError(MCP_RESOURCE_NOT_FOUND, `Order resource not found: ${uri}`);
+    }
+  }
+
+  private async refresh(uri: string): Promise<void> {
+    const subscription = this.subscriptions.get(uri);
+    if (!subscription || subscription.refreshing) return;
+
+    subscription.refreshing = true;
+    try {
+      const current = await this.read(uri);
+      if (this.subscriptions.get(uri) !== subscription) return;
+
+      const snapshot = current.contents[0]!.text;
+      if (snapshot !== subscription.snapshot) {
+        subscription.snapshot = snapshot;
+        await this.onUpdated(uri);
+      }
+    } catch (error) {
+      if (
+        this.subscriptions.get(uri) === subscription &&
+        error instanceof McpError &&
+        error.code === MCP_RESOURCE_NOT_FOUND
+      ) {
+        this.unsubscribe(uri);
+        await this.onUpdated(uri);
+      }
+    } finally {
+      subscription.refreshing = false;
+    }
+  }
+}
 
 if (!API_KEY) {
   process.stderr.write(
@@ -38,8 +141,44 @@ if (!OWS_WALLET_NAME) {
 
 const server = new Server(
   { name: 'stellar_card', version: PKG_VERSION },
-  { capabilities: { tools: {} } },
+  { capabilities: { tools: {}, resources: { subscribe: true } } },
 );
+
+let orderResourceClient: Stellar_CardClient | undefined;
+const orderResourceProvider = new OrderResourceProvider(
+  {
+    getOrder: (orderId) => {
+      orderResourceClient ??= new Stellar_CardClient({ apiKey: API_KEY, baseUrl: BASE_URL });
+      return orderResourceClient.getOrder(orderId);
+    },
+  },
+  (uri) => server.sendResourceUpdated({ uri }),
+);
+
+server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+  resourceTemplates: [
+    {
+      name: 'order_status',
+      uriTemplate: ORDER_RESOURCE_TEMPLATE,
+      description: 'Live payment, status, and fulfillment context for a card order.',
+      mimeType: 'application/json',
+    },
+  ],
+}));
+
+server.setRequestHandler(ReadResourceRequestSchema, ({ params }) =>
+  orderResourceProvider.read(params.uri),
+);
+
+server.setRequestHandler(SubscribeRequestSchema, async ({ params }) => {
+  await orderResourceProvider.subscribe(params.uri);
+  return {};
+});
+
+server.setRequestHandler(UnsubscribeRequestSchema, ({ params }) => {
+  orderResourceProvider.unsubscribe(params.uri);
+  return {};
+});
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
@@ -140,7 +279,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           base_asset: {
             type: 'string',
             enum: ['xlm', 'usdc', 'usd'],
-            description: "Base asset to convert from. Defaults to 'usd'. Options: 'xlm', 'usdc', 'usd'",
+            description:
+              "Base asset to convert from. Defaults to 'usd'. Options: 'xlm', 'usdc', 'usd'",
           },
           target_assets: {
             type: 'array',
@@ -162,7 +302,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           operation_type: {
             type: 'string',
             enum: ['card_purchase', 'payment', 'trustline', 'contract_invoke'],
-            description: 'Type of operation to estimate gas for. Options: card_purchase, payment, trustline, contract_invoke',
+            description:
+              'Type of operation to estimate gas for. Options: card_purchase, payment, trustline, contract_invoke',
           },
           include_base_fees: {
             type: 'boolean',
@@ -743,7 +884,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === 'get_exchange_rates') {
     try {
-      const result = await handleGetExchangeRates(args);
+      const result = await handleGetExchangeRates(args ?? {});
       return {
         content: [
           {
@@ -767,7 +908,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === 'get_gas_fee_estimates') {
     try {
-      const result = await handleGetGasFeeEstimates(args);
+      const result = await handleGetGasFeeEstimates(args ?? {});
       return {
         content: [
           {
@@ -890,7 +1031,9 @@ export async function handleGenerateCardPaymentUrl(
 }
 
 /** Handle get_exchange_rates tool. */
-async function handleGetExchangeRates(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function handleGetExchangeRates(
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
   const baseAsset = (args.base_asset as string) || 'usd';
   const targetAssets = (args.target_assets as string[]) || ['xlm', 'usdc', 'usd'];
 
@@ -900,7 +1043,7 @@ async function handleGetExchangeRates(args: Record<string, unknown>): Promise<Re
     usd: {
       usd: 1.0,
       usdc: 1.0,
-      xlm: 0.10,
+      xlm: 0.1,
       eur: 0.92,
       gbp: 0.79,
       jpy: 148.5,
@@ -908,7 +1051,7 @@ async function handleGetExchangeRates(args: Record<string, unknown>): Promise<Re
     usdc: {
       usd: 1.0,
       usdc: 1.0,
-      xlm: 0.10,
+      xlm: 0.1,
       eur: 0.92,
       gbp: 0.79,
       jpy: 148.5,
@@ -947,13 +1090,14 @@ async function handleGetExchangeRates(args: Record<string, unknown>): Promise<Re
 }
 
 /** Handle get_gas_fee_estimates tool. */
-async function handleGetGasFeeEstimates(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function handleGetGasFeeEstimates(
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
   const operationType = args.operation_type as string;
   const includeBaseFees = args.include_base_fees !== false;
 
   // Stellar base fee per operation (in stroops = 10^-7 XLM)
   const baseFeeStroops = 100;
-  const baseFeeXlm = baseFeeStroops / 1e7;
 
   // Soroban operation cost estimates (in stroops)
   const operationCosts: Record<string, number> = {
