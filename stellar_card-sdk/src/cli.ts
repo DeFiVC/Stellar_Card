@@ -112,6 +112,11 @@ Onboarding guide for agents: https://stellar_card.com/skill.md
     return walletCommand(rest);
   }
 
+  if (cmd === 'profile') {
+    const { profileCommand } = await import('./commands/profile');
+    return profileCommand(rest);
+  }
+
   if (cmd === 'logout' || cmd === 'cache-clear' || cmd === 'cache') {
     const { cacheCommand } = await import('./commands/cache');
     return cacheCommand(rest);
