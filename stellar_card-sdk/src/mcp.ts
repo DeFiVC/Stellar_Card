@@ -5,7 +5,15 @@
 import * as crypto from 'crypto';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  ListResourceTemplatesRequestSchema,
+  ReadResourceRequestSchema,
+  SubscribeRequestSchema,
+  UnsubscribeRequestSchema,
+  McpError,
+} from '@modelcontextprotocol/sdk/types.js';
 import {
   createOWSWallet,
   getOWSPublicKey,
@@ -14,6 +22,7 @@ import {
   purchaseCardOWS,
 } from './ows';
 import { Stellar_CardClient } from './client';
+import { Stellar_CardError } from './errors';
 // Audit A-38: version string imported from package.json instead of hardcoded.
 // The `with { type: 'json' }` import lets tsc emit a real assertion and
 // bun/node24 load it as JSON.
@@ -25,6 +34,100 @@ const BASE_URL = process.env.CARDS402_BASE_URL ?? 'https://api.stellar_card.com/
 const OWS_WALLET_NAME = process.env.OWS_WALLET_NAME ?? '';
 const OWS_WALLET_PASSPHRASE = process.env.OWS_WALLET_PASSPHRASE ?? undefined;
 const OWS_VAULT_PATH = process.env.OWS_VAULT_PATH ?? undefined;
+
+const ORDER_RESOURCE_TEMPLATE = 'stellar-card://orders/{orderId}';
+const MCP_RESOURCE_NOT_FOUND = -32002;
+
+interface OrderResourceSubscription {
+  timer: ReturnType<typeof setInterval>;
+  snapshot: string;
+  refreshing: boolean;
+}
+
+/** Serves JSON order snapshots and emits resource-updated notifications while subscribed. */
+export class OrderResourceProvider {
+  private readonly subscriptions = new Map<string, OrderResourceSubscription>();
+
+  constructor(
+    private readonly client: Pick<Stellar_CardClient, 'getOrder'>,
+    private readonly onUpdated: (uri: string) => Promise<void>,
+    private readonly pollIntervalMs = 3000,
+  ) {}
+
+  async read(uri: string) {
+    const orderId = this.orderIdFromUri(uri);
+    try {
+      const order = await this.client.getOrder(orderId);
+      return {
+        contents: [{ uri, mimeType: 'application/json', text: JSON.stringify(order) }],
+      };
+    } catch (error) {
+      if (error instanceof Stellar_CardError && error.status === 404) {
+        throw new McpError(MCP_RESOURCE_NOT_FOUND, `Order resource not found: ${uri}`);
+      }
+      throw error;
+    }
+  }
+
+  async subscribe(uri: string): Promise<void> {
+    if (this.subscriptions.has(uri)) return;
+
+    const initial = await this.read(uri);
+    const subscription: OrderResourceSubscription = {
+      timer: setInterval(() => void this.refresh(uri), this.pollIntervalMs),
+      snapshot: initial.contents[0]!.text,
+      refreshing: false,
+    };
+    this.subscriptions.set(uri, subscription);
+  }
+
+  unsubscribe(uri: string): void {
+    const subscription = this.subscriptions.get(uri);
+    if (!subscription) return;
+
+    clearInterval(subscription.timer);
+    this.subscriptions.delete(uri);
+  }
+
+  private orderIdFromUri(uri: string): string {
+    const match = /^stellar-card:\/\/orders\/([^/]+)$/.exec(uri);
+    if (!match) throw new McpError(MCP_RESOURCE_NOT_FOUND, `Order resource not found: ${uri}`);
+
+    try {
+      return decodeURIComponent(match[1]!);
+    } catch {
+      throw new McpError(MCP_RESOURCE_NOT_FOUND, `Order resource not found: ${uri}`);
+    }
+  }
+
+  private async refresh(uri: string): Promise<void> {
+    const subscription = this.subscriptions.get(uri);
+    if (!subscription || subscription.refreshing) return;
+
+    subscription.refreshing = true;
+    try {
+      const current = await this.read(uri);
+      if (this.subscriptions.get(uri) !== subscription) return;
+
+      const snapshot = current.contents[0]!.text;
+      if (snapshot !== subscription.snapshot) {
+        subscription.snapshot = snapshot;
+        await this.onUpdated(uri);
+      }
+    } catch (error) {
+      if (
+        this.subscriptions.get(uri) === subscription &&
+        error instanceof McpError &&
+        error.code === MCP_RESOURCE_NOT_FOUND
+      ) {
+        this.unsubscribe(uri);
+        await this.onUpdated(uri);
+      }
+    } finally {
+      subscription.refreshing = false;
+    }
+  }
+}
 
 if (!API_KEY) {
   process.stderr.write(
@@ -38,8 +141,44 @@ if (!OWS_WALLET_NAME) {
 
 const server = new Server(
   { name: 'stellar_card', version: PKG_VERSION },
-  { capabilities: { tools: {} } },
+  { capabilities: { tools: {}, resources: { subscribe: true } } },
 );
+
+let orderResourceClient: Stellar_CardClient | undefined;
+const orderResourceProvider = new OrderResourceProvider(
+  {
+    getOrder: (orderId) => {
+      orderResourceClient ??= new Stellar_CardClient({ apiKey: API_KEY, baseUrl: BASE_URL });
+      return orderResourceClient.getOrder(orderId);
+    },
+  },
+  (uri) => server.sendResourceUpdated({ uri }),
+);
+
+server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+  resourceTemplates: [
+    {
+      name: 'order_status',
+      uriTemplate: ORDER_RESOURCE_TEMPLATE,
+      description: 'Live payment, status, and fulfillment context for a card order.',
+      mimeType: 'application/json',
+    },
+  ],
+}));
+
+server.setRequestHandler(ReadResourceRequestSchema, ({ params }) =>
+  orderResourceProvider.read(params.uri),
+);
+
+server.setRequestHandler(SubscribeRequestSchema, async ({ params }) => {
+  await orderResourceProvider.subscribe(params.uri);
+  return {};
+});
+
+server.setRequestHandler(UnsubscribeRequestSchema, ({ params }) => {
+  orderResourceProvider.unsubscribe(params.uri);
+  return {};
+});
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
@@ -140,7 +279,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           base_asset: {
             type: 'string',
             enum: ['xlm', 'usdc', 'usd'],
-            description: "Base asset to convert from. Defaults to 'usd'. Options: 'xlm', 'usdc', 'usd'",
+            description:
+              "Base asset to convert from. Defaults to 'usd'. Options: 'xlm', 'usdc', 'usd'",
           },
           target_assets: {
             type: 'array',
@@ -153,6 +293,41 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'create_and_fund_card',
+      description:
+        'Create an order, pay via the Soroban receiver contract using the configured OWS wallet, and wait for card activation in one call. Returns the card token, masked PAN, expiration date, and the payment transaction hash. Hard-capped at $500 (USD) per card — amounts above that are rejected before any order or payment is attempted.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          amount: {
+            type: 'string',
+            pattern: '^\\d+(\\.\\d{1,2})?$',
+            description:
+              "Card value as a decimal string, e.g. '25.00'. Minimum '0.01', maximum '500.00' (hard single-card-funding limit).",
+          },
+          currency: {
+            type: 'string',
+            enum: ['USD'],
+            description:
+              "Currency the amount is denominated in. Only 'USD' is supported today — the $500 cap is enforced directly on 'amount' with no conversion. Defaults to 'USD'.",
+          },
+          merchant_tags: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'Optional free-form merchant/category tags attached to the order metadata.',
+          },
+          payment_asset: {
+            type: 'string',
+            enum: ['auto', 'usdc', 'xlm'],
+            description:
+              "Payment asset: 'auto' (default — picks USDC if the wallet has enough, else XLM), 'usdc', or 'xlm'.",
+          },
+        },
+        required: ['amount'],
+      },
+    },
+    {
       name: 'get_gas_fee_estimates',
       description:
         'Get estimated Soroban gas fees for common operations. Helps forecast transaction costs and optimize batch sizing.',
@@ -162,7 +337,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           operation_type: {
             type: 'string',
             enum: ['card_purchase', 'payment', 'trustline', 'contract_invoke'],
-            description: 'Type of operation to estimate gas for. Options: card_purchase, payment, trustline, contract_invoke',
+            description:
+              'Type of operation to estimate gas for. Options: card_purchase, payment, trustline, contract_invoke',
           },
           include_base_fees: {
             type: 'boolean',
@@ -622,6 +798,52 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   }
 
+  if (name === 'create_and_fund_card') {
+    if (!OWS_WALLET_NAME) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: 'Error: OWS_WALLET_NAME is not set. Run setup_wallet for configuration instructions.',
+          },
+        ],
+        isError: true,
+      };
+    }
+    try {
+      const result = await handleCreateAndFundCard(args, {
+        apiKey: API_KEY,
+        baseUrl: BASE_URL,
+        walletName: OWS_WALLET_NAME,
+        passphrase: OWS_WALLET_PASSPHRASE,
+        vaultPath: OWS_VAULT_PATH,
+      });
+      return {
+        content: [
+          {
+            type: 'text',
+            text: [
+              'Card created and funded.',
+              '',
+              `Card token:  ${result.card_token}`,
+              `Masked PAN:  ${result.masked_pan}`,
+              `Expiration:  ${result.expiration_date}`,
+              `Tx hash:     ${result.tx_hash}`,
+              '',
+              `Order ID: ${result.order_id}`,
+            ].join('\n'),
+          },
+        ],
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        content: [{ type: 'text', text: `Error creating and funding card: ${message}` }],
+        isError: true,
+      };
+    }
+  }
+
   if (name === 'check_order') {
     // Validate order_id before using it in a URL path
     const rawOrderId = String((args as Record<string, unknown>).order_id ?? '').trim();
@@ -743,7 +965,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === 'get_exchange_rates') {
     try {
-      const result = await handleGetExchangeRates(args);
+      const result = await handleGetExchangeRates(args ?? {});
       return {
         content: [
           {
@@ -767,7 +989,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === 'get_gas_fee_estimates') {
     try {
-      const result = await handleGetGasFeeEstimates(args);
+      const result = await handleGetGasFeeEstimates(args ?? {});
       return {
         content: [
           {
@@ -889,8 +1111,175 @@ export async function handleGenerateCardPaymentUrl(
   };
 }
 
+/**
+ * Hard single-card-funding limit, in USD, for {@link handleCreateAndFundCard}
+ * (#735). Enforced inclusively — exactly $500.00 is allowed, anything above
+ * is rejected. Only USD is supported today: there is no currency-conversion
+ * path elsewhere in this SDK (see `generate_card_payment_url`, which also
+ * treats `currency` as a label rather than converting), so for any currency
+ * other than 'USD' this gates directly on the numeric `amount` value and
+ * documents the limitation in the schema description above rather than
+ * pretending to convert.
+ */
+export const MAX_CARD_FUNDING_USD = 500;
+
+export interface CreateAndFundCardArgs {
+  amount: string;
+  currency?: string;
+  merchant_tags?: string[];
+  payment_asset?: 'auto' | 'usdc' | 'xlm';
+}
+
+export interface CreateAndFundCardResult {
+  order_id: string;
+  card_token: string;
+  masked_pan: string;
+  expiration_date: string;
+  tx_hash: string;
+}
+
+/**
+ * MCP tool error — thrown by {@link handleCreateAndFundCard} for invalid
+ * input or a hard business-rule rejection (e.g. over the funding limit).
+ * Callers (the MCP dispatch handler, and tests) catch this and surface it
+ * as `{ isError: true }` rather than letting it propagate as an unhandled
+ * exception.
+ */
+export class McpToolError extends Error {}
+
+/**
+ * create_and_fund_card (#735): create an order, pay it via the Soroban
+ * receiver contract using the configured OWS wallet, and wait for card
+ * activation — all in one call. Hard-enforces a $500 max single-card
+ * funding limit, checked BEFORE any order is created or payment attempted.
+ *
+ * @param args - Raw MCP tool arguments (validated here, not trusted from the client).
+ * @param env - Wallet/API configuration normally sourced from process.env in mcp.ts.
+ * @param deps - Injectable dependencies for testing (defaults to the real SDK calls).
+ */
+export async function handleCreateAndFundCard(
+  args: unknown,
+  env: {
+    apiKey: string;
+    baseUrl: string;
+    walletName: string;
+    passphrase?: string;
+    vaultPath?: string;
+  },
+  deps: {
+    createOrder?: (
+      client: import('./client').Stellar_CardClient,
+      opts: import('./client').OrderOptions,
+    ) => Promise<import('./client').OrderResponse>;
+    payViaContractOWS?: typeof import('./ows').payViaContractOWS;
+    getOWSBalance?: typeof import('./ows').getOWSBalance;
+    waitForCard?: (
+      client: import('./client').Stellar_CardClient,
+      orderId: string,
+      opts?: import('./client').WaitForCardOptions,
+    ) => Promise<import('./client').CardDetails>;
+  } = {},
+): Promise<CreateAndFundCardResult> {
+  if (!args || typeof args !== 'object') {
+    throw new McpToolError('create_and_fund_card: arguments must be an object');
+  }
+  const {
+    amount,
+    currency = 'USD',
+    merchant_tags,
+    payment_asset = 'auto',
+  } = args as Record<string, unknown>;
+
+  if (typeof amount !== 'string' || !/^\d+(\.\d{1,2})?$/.test(amount)) {
+    throw new McpToolError(
+      "create_and_fund_card: 'amount' is required and must be a positive decimal string (e.g. '25.00')",
+    );
+  }
+  const amountNum = parseFloat(amount);
+  if (amountNum < 0.01) {
+    throw new McpToolError("create_and_fund_card: 'amount' must be at least 0.01");
+  }
+  if (currency !== undefined && typeof currency !== 'string') {
+    throw new McpToolError("create_and_fund_card: 'currency' must be a string");
+  }
+  const currencyStr = String(currency).toUpperCase();
+  if (merchant_tags !== undefined) {
+    if (!Array.isArray(merchant_tags) || !merchant_tags.every((t) => typeof t === 'string')) {
+      throw new McpToolError("create_and_fund_card: 'merchant_tags' must be an array of strings");
+    }
+  }
+  if (payment_asset !== 'auto' && payment_asset !== 'usdc' && payment_asset !== 'xlm') {
+    throw new McpToolError(
+      "create_and_fund_card: 'payment_asset' must be 'auto', 'usdc', or 'xlm'",
+    );
+  }
+
+  // Hard $500 cap — checked before any order creation or payment attempt.
+  // Only USD is supported for conversion purposes (see MAX_CARD_FUNDING_USD
+  // doc comment); a non-USD currency still gates directly on the numeric
+  // amount, which is the documented limitation rather than a silent bug.
+  if (amountNum > MAX_CARD_FUNDING_USD) {
+    throw new McpToolError(
+      `create_and_fund_card: amount ($${amount} ${currencyStr}) exceeds the $${MAX_CARD_FUNDING_USD.toFixed(2)} ` +
+        'maximum single-card funding limit. Request a smaller amount or issue multiple cards.',
+    );
+  }
+
+  const ows = await import('./ows');
+  const { Stellar_CardClient } = await import('./client');
+
+  const createOrder = deps.createOrder ?? ((c, o) => c.createOrder(o));
+  const payViaContractOWSFn = deps.payViaContractOWS ?? ows.payViaContractOWS;
+  const getOWSBalanceFn = deps.getOWSBalance ?? ows.getOWSBalance;
+  const waitForCard = deps.waitForCard ?? ((c, orderId, opts) => c.waitForCard(orderId, opts));
+
+  let resolvedAsset: 'usdc' | 'xlm';
+  if (payment_asset === 'auto') {
+    try {
+      const balance = await getOWSBalanceFn(env.walletName, env.vaultPath);
+      resolvedAsset = parseFloat(balance.usdc) >= amountNum ? 'usdc' : 'xlm';
+    } catch {
+      resolvedAsset = 'xlm';
+    }
+  } else {
+    resolvedAsset = payment_asset;
+  }
+
+  const client = new Stellar_CardClient({ apiKey: env.apiKey, baseUrl: env.baseUrl });
+
+  // 1. Create the order.
+  const order = await createOrder(client, {
+    amount_usdc: amount,
+    metadata: merchant_tags ? { merchant_tags, currency: currencyStr } : { currency: currencyStr },
+  });
+
+  // 2. Simulate / submit the Soroban payment via the OWS wallet. Returns the
+  // real transaction hash — unlike purchaseCardOWS's all-in-one flow, we
+  // keep this step explicit so the hash can be surfaced in the tool result.
+  const paymentResult = await payViaContractOWSFn({
+    walletName: env.walletName,
+    payment: order.payment,
+    paymentAsset: resolvedAsset,
+    passphrase: env.passphrase,
+    vaultPath: env.vaultPath,
+  });
+
+  // 3. Wait for card activation.
+  const card = await waitForCard(client, order.order_id);
+
+  return {
+    order_id: order.order_id,
+    card_token: card.number,
+    masked_pan: `•••• •••• •••• ${card.number.slice(-4)}`,
+    expiration_date: card.expiry,
+    tx_hash: paymentResult.hash,
+  };
+}
+
 /** Handle get_exchange_rates tool. */
-async function handleGetExchangeRates(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function handleGetExchangeRates(
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
   const baseAsset = (args.base_asset as string) || 'usd';
   const targetAssets = (args.target_assets as string[]) || ['xlm', 'usdc', 'usd'];
 
@@ -900,7 +1289,7 @@ async function handleGetExchangeRates(args: Record<string, unknown>): Promise<Re
     usd: {
       usd: 1.0,
       usdc: 1.0,
-      xlm: 0.10,
+      xlm: 0.1,
       eur: 0.92,
       gbp: 0.79,
       jpy: 148.5,
@@ -908,7 +1297,7 @@ async function handleGetExchangeRates(args: Record<string, unknown>): Promise<Re
     usdc: {
       usd: 1.0,
       usdc: 1.0,
-      xlm: 0.10,
+      xlm: 0.1,
       eur: 0.92,
       gbp: 0.79,
       jpy: 148.5,
@@ -947,13 +1336,14 @@ async function handleGetExchangeRates(args: Record<string, unknown>): Promise<Re
 }
 
 /** Handle get_gas_fee_estimates tool. */
-async function handleGetGasFeeEstimates(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function handleGetGasFeeEstimates(
+  args: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
   const operationType = args.operation_type as string;
   const includeBaseFees = args.include_base_fees !== false;
 
   // Stellar base fee per operation (in stroops = 10^-7 XLM)
   const baseFeeStroops = 100;
-  const baseFeeXlm = baseFeeStroops / 1e7;
 
   // Soroban operation cost estimates (in stroops)
   const operationCosts: Record<string, number> = {

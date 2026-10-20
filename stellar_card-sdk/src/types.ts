@@ -1045,6 +1045,91 @@ export interface OrderHistoryResponse {
 }
 
 // ============================================================================
+// ORDER STATUS DISCRIMINATED UNION & TYPE GUARDS (#729)
+// ============================================================================
+
+/**
+ * Card details attached to an order once it reaches the ACTIVE status.
+ * Mirrors {@link CardDetails} from `./client` but is kept local here so
+ * `types.ts` has no dependency on `client.ts`.
+ */
+export interface OrderCard {
+  /** 16-digit card number. */
+  number: string;
+  /** 3-digit CVV. */
+  cvv: string;
+  /** Expiry in MM/YY format. */
+  expiry: string;
+  /** Card brand (e.g. "Visa"), or null when not provided. */
+  brand: string | null;
+}
+
+/**
+ * Status literals used by the discriminated {@link Order} union.
+ *
+ * These match the runtime status strings the backend actually sends (see
+ * `src/__tests__/order-polling.test.ts`): `'ACTIVE'` once a card has been
+ * issued, `'FAILED'` (also covers `'EXPIRED'`-style terminal failures, which
+ * the SDK normalizes to `'FAILED'` for guard purposes), and everything else
+ * — e.g. `'pending_payment'`, `'processing'` — is `'PENDING'`.
+ */
+export type OrderStatusLiteral = 'ACTIVE' | 'PENDING' | 'FAILED';
+
+/** Base fields shared by every branch of the {@link Order} union. */
+interface BaseOrder {
+  order_id: string;
+  amount_usdc: string;
+  payment_asset: PaymentAsset;
+  created_at: string;
+  updated_at: string;
+}
+
+/** An order whose card has been issued. `card` is required and non-null. */
+export interface ActiveOrder extends BaseOrder {
+  status: 'ACTIVE';
+  /** Issued card details — always present once an order is ACTIVE. */
+  card: OrderCard;
+}
+
+/** An order still awaiting payment or processing. Never has a `card`. */
+export interface PendingOrder extends BaseOrder {
+  status: 'PENDING';
+  card?: never;
+}
+
+/** An order that failed, expired, was rejected, or was refunded. */
+export interface FailedOrder extends BaseOrder {
+  status: 'FAILED';
+  card?: never;
+  /** Human-readable failure reason, when available. */
+  error?: string;
+}
+
+/** Discriminated union over an order's lifecycle, keyed on `status`. */
+export type Order = ActiveOrder | PendingOrder | FailedOrder;
+
+/**
+ * Type guard — narrows `order` to {@link ActiveOrder}.
+ *
+ * After this guard returns `true`, `order.card` is accessible without any
+ * further null check — `card` is a required, non-optional field on the
+ * `ActiveOrder` branch of the {@link Order} union.
+ */
+export function isActiveOrder(order: Order): order is ActiveOrder {
+  return order.status === 'ACTIVE';
+}
+
+/** Type guard — narrows `order` to {@link PendingOrder}. */
+export function isPendingOrder(order: Order): order is PendingOrder {
+  return order.status === 'PENDING';
+}
+
+/** Type guard — narrows `order` to {@link FailedOrder}. */
+export function isFailedOrder(order: Order): order is FailedOrder {
+  return order.status === 'FAILED';
+}
+
+// ============================================================================
 // ORDER EVENT TYPE GUARDS
 // ============================================================================
 

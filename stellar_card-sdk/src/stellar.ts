@@ -10,6 +10,8 @@ import {
   Asset,
   BASE_FEE,
   StrKey,
+  Memo,
+  Claimant,
 } from '@stellar/stellar-sdk';
 import type { CardDetails, PaymentInstructions } from './client';
 import {
@@ -18,9 +20,18 @@ import {
   decimalToStroops,
   selectContractCall,
   InsufficientFeeError,
+  validateBaseFee,
+} from './soroban';
+export {
+  setDefaultBaseFee,
+  getDefaultBaseFee,
+  resetDefaultBaseFee,
+  DEFAULT_BASE_FEE_STROOPS,
+  MAX_BASE_FEE_STROOPS,
 } from './soroban';
 import type { ContractPaymentResult } from './types';
 import type { Logger } from './logger';
+import { InvalidMemoError } from './errors';
 
 const USDC_ISSUER = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN';
 const HORIZON_TIMEOUT_MS = 15000;
@@ -91,7 +102,9 @@ export async function estimateXlmRequired(
 ): Promise<XlmEstimateResult> {
   const numUsdc = typeof usdcAmount === 'string' ? parseFloat(usdcAmount) : Number(usdcAmount);
   if (isNaN(numUsdc) || numUsdc <= 0) {
-    throw new Error(`Invalid USDC amount for estimation: ${usdcAmount}. Must be a positive number.`);
+    throw new Error(
+      `Invalid USDC amount for estimation: ${usdcAmount}. Must be a positive number.`,
+    );
   }
 
   const slippage = opts.slippage ?? 0.01;
@@ -103,7 +116,9 @@ export async function estimateXlmRequired(
   let orderbookError: unknown;
 
   try {
-    const server = opts.horizonUrl ? new Horizon.Server(opts.horizonUrl) : getServer(opts.networkPassphrase);
+    const server = opts.horizonUrl
+      ? new Horizon.Server(opts.horizonUrl)
+      : getServer(opts.networkPassphrase);
     const book = await withTimeout(server.orderbook(usdcAsset, xlmAsset).call());
     if (book.asks && book.asks.length > 0) {
       effectiveRate = parseFloat(book.asks[0].price);
@@ -241,6 +256,75 @@ export interface AccountBalances {
   funded: boolean;
 }
 
+/** Account and optional memo returned by a SEP-0002 federation lookup. */
+export interface FederationAddressResolution {
+  accountId: string;
+  memo?: string;
+  memoType?: 'id' | 'text' | 'hash' | 'return';
+}
+
+/** Check whether a string is a valid Stellar account or Soroban contract address. */
+export function isValidStellarAddress(address: string): boolean {
+  return (
+    typeof address === 'string' &&
+    (StrKey.isValidEd25519PublicKey(address) || StrKey.isValidContract(address))
+  );
+}
+
+/**
+ * Resolve a SEP-0002 federation address such as `alice*stellarcard.com`.
+ *
+ * @throws {Error} If the address is malformed, lookup fails, or the federation
+ * response does not contain a matching valid account and memo.
+ */
+export async function resolveFederationAddress(
+  fedAddress: string,
+): Promise<FederationAddressResolution> {
+  const match = /^([^*\s]+)\*([A-Za-z0-9.-]+)$/.exec(fedAddress);
+  if (
+    !match ||
+    match[2].split('.').some((label) => !/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(label))
+  ) {
+    throw new Error(`Invalid federation address: ${fedAddress}`);
+  }
+
+  const url = `https://${match[2]}/federation?type=name&q=${encodeURIComponent(fedAddress)}`;
+  const response = await fetch(url, { headers: { Accept: 'application/json' } });
+  if (!response.ok) {
+    throw new Error(`Federation lookup failed with HTTP ${response.status}`);
+  }
+
+  const result: unknown = await response.json();
+  if (typeof result !== 'object' || result === null) {
+    throw new Error('Invalid federation response');
+  }
+
+  const body = result as Record<string, unknown>;
+  if (
+    body.stellar_address !== fedAddress ||
+    typeof body.account_id !== 'string' ||
+    !StrKey.isValidEd25519PublicKey(body.account_id)
+  ) {
+    throw new Error('Federation response contains an invalid address or account ID');
+  }
+
+  const resolution: FederationAddressResolution = { accountId: body.account_id };
+  if (body.memo !== undefined || body.memo_type !== undefined) {
+    const validMemoTypes = ['id', 'text', 'hash', 'return'];
+    if (
+      typeof body.memo !== 'string' ||
+      typeof body.memo_type !== 'string' ||
+      !validMemoTypes.includes(body.memo_type)
+    ) {
+      throw new Error('Federation response contains invalid memo details');
+    }
+    resolution.memo = body.memo;
+    resolution.memoType = body.memo_type as FederationAddressResolution['memoType'];
+  }
+
+  return resolution;
+}
+
 /** How long balance lookups are cached, in ms. */
 export const BALANCE_CACHE_TTL_MS = 3000;
 const balanceCache = new Map<string, { expires: number; value: Promise<AccountBalances> }>();
@@ -363,6 +447,16 @@ export interface PayOpts {
   horizonUrl?: string;
   /** Optional logger instance */
   logger?: Logger;
+  /**
+   * Per-call base fee override, in stroops per operation (#732). Takes
+   * precedence over the client-level default set via
+   * {@link setDefaultBaseFee} for this one call. Must be a positive
+   * integer no greater than {@link MAX_BASE_FEE_STROOPS} (100,000
+   * stroops) — larger values throw {@link ValidationError} before any
+   * network call is made. Defaults to {@link DEFAULT_BASE_FEE_STROOPS}
+   * (100 stroops) when neither this nor a client-level default is set.
+   */
+  baseFee?: number;
 }
 
 /**
@@ -400,10 +494,18 @@ export async function payViaContract(opts: PayOpts): Promise<ContractPaymentResu
     sorobanRpcUrl,
     horizonUrl,
     logger,
+    baseFee,
   } = opts;
 
   if (!StrKey.isValidContract(payment.contract_id)) {
     throw new Error(`Invalid contract_id in order response: ${payment.contract_id}`);
+  }
+
+  // Validate the per-call override up front — before any network call —
+  // so a bad baseFee fails fast with a clear error instead of surfacing
+  // as a confusing Soroban rejection later.
+  if (baseFee !== undefined) {
+    validateBaseFee(baseFee);
   }
 
   const keypair = Keypair.fromSecret(walletSecret);
@@ -430,6 +532,7 @@ export async function payViaContract(opts: PayOpts): Promise<ContractPaymentResu
       networkPassphrase,
       rpcUrl: sorobanRpcUrl,
       fee,
+      baseFee,
     });
     tx.sign(keypair);
     try {
@@ -697,6 +800,392 @@ export async function submitSignedTransaction(
     feeRefunded: result.feeRefunded ?? '0',
     maxFee: result.maxFee ?? String(tx.fee ?? BASE_FEE),
   };
+// ── Transaction memo builder (#739) ──────────────────────────────────────────
+
+/** Supported {@link buildTransactionMemo} memo types. */
+export type MemoType = 'text' | 'id' | 'hash' | 'return';
+
+/** Maximum byte length of a Stellar `MEMO_TEXT` value, per the protocol. */
+export const MEMO_TEXT_MAX_BYTES = 28;
+
+/** Byte length required for `MEMO_HASH` / `MEMO_RETURN` values. */
+export const MEMO_HASH_BYTES = 32;
+
+/** Inclusive range for a `MEMO_ID` value (an unsigned 64-bit integer). */
+export const MEMO_ID_MAX = 18446744073709551615n;
+
+/**
+ * Build a type-safe Stellar transaction {@link Memo} from a `memoType` and
+ * raw `value`, validating the value against the constraints the Stellar
+ * protocol enforces for that memo type before handing it to the SDK's
+ * `Memo` factory.
+ *
+ * - `'text'` — a UTF-8 string, validated against its actual **byte**
+ *   length (not character count), since multi-byte characters (emoji,
+ *   non-Latin scripts, etc.) count for more than one byte each. Max
+ *   {@link MEMO_TEXT_MAX_BYTES} bytes.
+ * - `'id'` — an unsigned 64-bit integer, accepted as a `string`, `number`,
+ *   or `bigint`. Must be a non-negative integer that fits in a uint64.
+ * - `'hash'` / `'return'` — exactly {@link MEMO_HASH_BYTES} raw bytes,
+ *   accepted as a `Buffer`, `Uint8Array`, or a 64-character hex string.
+ *
+ * @param memoType - Which memo variant to build.
+ * @param value - The raw value to encode; its accepted shape depends on `memoType` (see above).
+ * @returns A Stellar SDK {@link Memo} ready to attach via `TransactionBuilder.addMemo`.
+ * @throws {InvalidMemoError} When `value` violates the length/format constraints for `memoType`,
+ *   or when `memoType` is not one of `'text' | 'id' | 'hash' | 'return'`.
+ *
+ * @example
+ * ```typescript
+ * const memo = buildTransactionMemo('text', 'order-4821');
+ * const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase })
+ *   .addMemo(memo)
+ *   .addOperation(...)
+ *   .setTimeout(300)
+ *   .build();
+ * ```
+ */
+export function buildTransactionMemo(
+  memoType: MemoType,
+  value: string | number | bigint | Buffer | Uint8Array,
+): Memo {
+  switch (memoType) {
+    case 'text': {
+      if (typeof value !== 'string') {
+        throw new InvalidMemoError(memoType, 'Expected a string value for MEMO_TEXT.');
+      }
+      const byteLength = Buffer.byteLength(value, 'utf-8');
+      if (byteLength > MEMO_TEXT_MAX_BYTES) {
+        throw new InvalidMemoError(
+          memoType,
+          `Text memo exceeds ${MEMO_TEXT_MAX_BYTES} bytes when UTF-8 encoded (got ${byteLength} bytes). ` +
+            'Note: multi-byte characters (emoji, non-Latin scripts) count as more than one byte each.',
+        );
+      }
+      return Memo.text(value);
+    }
+    case 'id': {
+      let idStr: string;
+      if (typeof value === 'bigint') {
+        idStr = value.toString();
+      } else if (typeof value === 'number') {
+        if (!Number.isInteger(value) || value < 0) {
+          throw new InvalidMemoError(memoType, `Expected a non-negative integer, got ${value}.`);
+        }
+        idStr = value.toString();
+      } else if (typeof value === 'string' && /^\d+$/.test(value)) {
+        idStr = value;
+      } else {
+        throw new InvalidMemoError(
+          memoType,
+          'Expected a non-negative integer as a string, number, or bigint for MEMO_ID.',
+        );
+      }
+      let idBig: bigint;
+      try {
+        idBig = BigInt(idStr);
+      } catch {
+        throw new InvalidMemoError(memoType, `"${String(value)}" is not a valid integer.`);
+      }
+      if (idBig < 0n || idBig > MEMO_ID_MAX) {
+        throw new InvalidMemoError(
+          memoType,
+          `ID memo must fit in an unsigned 64-bit integer (0 to ${MEMO_ID_MAX}), got ${idBig}.`,
+        );
+      }
+      return Memo.id(idBig.toString());
+    }
+    case 'hash':
+    case 'return': {
+      const bytes = normalizeMemoHashInput(memoType, value);
+      const hex = bytes.toString('hex');
+      return memoType === 'hash' ? Memo.hash(hex) : Memo.return(hex);
+    }
+    default:
+      throw new InvalidMemoError(
+        String(memoType),
+        `Unsupported memo type. Expected 'text', 'id', 'hash', or 'return'.`,
+      );
+  }
+}
+
+/** Coerce a hash/return memo input into exactly {@link MEMO_HASH_BYTES} raw bytes, or throw. */
+function normalizeMemoHashInput(
+  memoType: 'hash' | 'return',
+  value: string | number | bigint | Buffer | Uint8Array,
+): Buffer {
+  let bytes: Buffer;
+  if (Buffer.isBuffer(value)) {
+    bytes = value;
+  } else if (value instanceof Uint8Array) {
+    bytes = Buffer.from(value);
+  } else if (typeof value === 'string') {
+    if (!/^[0-9a-fA-F]*$/.test(value) || value.length % 2 !== 0) {
+      throw new InvalidMemoError(
+        memoType,
+        'Expected a hex-encoded string (even length, hex characters only) for MEMO_HASH/MEMO_RETURN.',
+      );
+    }
+    bytes = Buffer.from(value, 'hex');
+  } else {
+    throw new InvalidMemoError(
+      memoType,
+      'Expected a Buffer, Uint8Array, or hex string for MEMO_HASH/MEMO_RETURN.',
+    );
+  }
+  if (bytes.length !== MEMO_HASH_BYTES) {
+    throw new InvalidMemoError(
+      memoType,
+      `Expected exactly ${MEMO_HASH_BYTES} bytes, got ${bytes.length}.`,
+    );
+  }
+  return bytes;
+}
+
+// ── Claimable balances (#736) ────────────────────────────────────────────────
+
+/** A timelock predicate for a {@link createClaimableBalance} claimant. */
+export interface ClaimPredicate {
+  /** Claimant may claim at any time (no predicate). */
+  unconditional?: true;
+  /** Claimant may claim only before this absolute time. */
+  beforeAbsoluteTime?: Date | string | number;
+  /** Claimant may claim only after this absolute time (expressed as "not before" via a negated predicate). */
+  afterAbsoluteTime?: Date | string | number;
+}
+
+/** One claimant + predicate pair for {@link createClaimableBalance}. */
+export interface ClaimableBalanceClaimant {
+  /** Stellar G-address allowed to claim under `predicate`. */
+  destination: string;
+  /** When this claimant may claim the balance. Defaults to unconditional. */
+  predicate?: ClaimPredicate;
+}
+
+/** Options for {@link createClaimableBalance}. */
+export interface CreateClaimableBalanceOpts {
+  /** Stellar secret key (S-address) of the account funding the balance. */
+  sourceSecret: string;
+  /** Asset to escrow. Defaults to native XLM. */
+  asset?: Asset;
+  /** Decimal amount of `asset` to escrow, e.g. `"10.0000000"`. */
+  amount: string;
+  /** One or more claimants, each with its own predicate. */
+  claimants: ClaimableBalanceClaimant[];
+  /** Stellar network passphrase. Defaults to `Networks.PUBLIC`. */
+  networkPassphrase?: string;
+  /** Override the Horizon REST API URL. */
+  horizonUrl?: string;
+}
+
+function toUnixSeconds(value: Date | string | number): string {
+  const ms = value instanceof Date ? value.getTime() : new Date(value).getTime();
+  if (Number.isNaN(ms)) {
+    throw new Error(`Invalid claim predicate timestamp: ${String(value)}`);
+  }
+  return Math.floor(ms / 1000).toString();
+}
+
+function buildClaimPredicate(predicate?: ClaimPredicate) {
+  if (!predicate || predicate.unconditional) {
+    return Claimant.predicateUnconditional();
+  }
+  const predicates = [];
+  if (predicate.beforeAbsoluteTime !== undefined) {
+    predicates.push(
+      Claimant.predicateBeforeAbsoluteTime(toUnixSeconds(predicate.beforeAbsoluteTime)),
+    );
+  }
+  if (predicate.afterAbsoluteTime !== undefined) {
+    // Stellar has no native "after" predicate — express it as the negation
+    // of "before", so the claimant can only claim once that time has passed.
+    predicates.push(
+      Claimant.predicateNot(
+        Claimant.predicateBeforeAbsoluteTime(toUnixSeconds(predicate.afterAbsoluteTime)),
+      ),
+    );
+  }
+  if (predicates.length === 0) {
+    return Claimant.predicateUnconditional();
+  }
+  if (predicates.length === 1) {
+    const [only] = predicates;
+    if (!only) {
+      return Claimant.predicateUnconditional();
+    }
+    return only;
+  }
+  const [first, second] = predicates;
+  if (!first || !second) {
+    // Unreachable given the length check above, but keeps this type-safe.
+    return Claimant.predicateUnconditional();
+  }
+  return Claimant.predicateAnd(first, second);
+}
+
+/**
+ * Escrow an amount of an asset on-chain via a `CreateClaimableBalance`
+ * operation, releasable by one or more claimants under optional
+ * before/after timelock predicates.
+ *
+ * @param opts - Source account, asset/amount, and the list of claimants with their predicates.
+ * @returns Promise resolving to the submitted transaction hash.
+ * @throws {Error} When the source secret is invalid or the transaction is rejected by Horizon.
+ *
+ * @example
+ * ```typescript
+ * const hash = await createClaimableBalance({
+ *   sourceSecret: process.env.STELLAR_SECRET!,
+ *   amount: '10.0000000',
+ *   claimants: [
+ *     { destination: 'GRECEIVER...', predicate: { beforeAbsoluteTime: '2027-01-01T00:00:00Z' } },
+ *   ],
+ * });
+ * ```
+ */
+export async function createClaimableBalance(opts: CreateClaimableBalanceOpts): Promise<string> {
+  const {
+    sourceSecret,
+    asset = Asset.native(),
+    amount,
+    claimants,
+    networkPassphrase = Networks.PUBLIC,
+    horizonUrl,
+  } = opts;
+
+  if (!claimants || claimants.length === 0) {
+    throw new Error('createClaimableBalance requires at least one claimant.');
+  }
+
+  const keypair = Keypair.fromSecret(sourceSecret);
+  const server = horizonUrl ? new Horizon.Server(horizonUrl) : getServer(networkPassphrase);
+  const account = await withTimeout(server.loadAccount(keypair.publicKey()));
+
+  const sdkClaimants = claimants.map(
+    (c) => new Claimant(c.destination, buildClaimPredicate(c.predicate)),
+  );
+
+  const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase })
+    .addOperation(
+      Operation.createClaimableBalance({
+        asset,
+        amount,
+        claimants: sdkClaimants,
+      }),
+    )
+    .setTimeout(300)
+    .build();
+  tx.sign(keypair);
+  const result = await withTimeout(server.submitTransaction(tx));
+  return result.hash;
+}
+
+/**
+ * Claim a previously created claimable balance.
+ *
+ * @param balanceId - The claimable balance ID (as returned by Horizon or
+ *   {@link createClaimableBalance}'s transaction result).
+ * @param claimantKeypair - Keypair (or secret key string) of the claimant account.
+ * @param opts - Optional network passphrase / Horizon URL overrides.
+ * @returns Promise resolving to the submitted transaction hash.
+ * @throws {Error} When the balance has already been claimed, the predicate
+ *   has not yet been satisfied, or Horizon rejects the transaction.
+ *
+ * @example
+ * ```typescript
+ * const hash = await claimBalance(balanceId, claimantSecret);
+ * ```
+ */
+export async function claimBalance(
+  balanceId: string,
+  claimantKeypair: Keypair | string,
+  opts: { networkPassphrase?: string; horizonUrl?: string } = {},
+): Promise<string> {
+  const keypair =
+    typeof claimantKeypair === 'string' ? Keypair.fromSecret(claimantKeypair) : claimantKeypair;
+  const networkPassphrase = opts.networkPassphrase ?? Networks.PUBLIC;
+  const server = opts.horizonUrl
+    ? new Horizon.Server(opts.horizonUrl)
+    : getServer(networkPassphrase);
+  const account = await withTimeout(server.loadAccount(keypair.publicKey()));
+
+  const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase })
+    .addOperation(Operation.claimClaimableBalance({ balanceId }))
+    .setTimeout(300)
+    .build();
+  tx.sign(keypair);
+  const result = await withTimeout(server.submitTransaction(tx));
+  return result.hash;
+}
+
+/** One claimable balance entry as returned by {@link getClaimableBalances}. */
+export interface ClaimableBalanceEntry {
+  /** The claimable balance ID, used with {@link claimBalance}. */
+  id: string;
+  /** Asset held in escrow, e.g. `"native"` or `"USDC:GISSUER..."`. */
+  asset: string;
+  /** Decimal amount held in escrow. */
+  amount: string;
+  /** The account that funded (created) the balance. */
+  sponsor?: string;
+  /** Claimants and their raw predicate XDR, as returned by Horizon. */
+  claimants: Array<{ destination: string; predicate: unknown }>;
+  /** Ledger sequence at which the balance was last modified. */
+  lastModifiedLedger: number;
+}
+
+/**
+ * Query every claimable balance a given account is a claimant on, from Horizon.
+ *
+ * @param publicKey - Stellar G-address of the claimant to query for.
+ * @param opts - Optional network passphrase / Horizon URL overrides, and a result `limit`.
+ * @returns Promise resolving to the list of claimable balance entries.
+ * @throws {Error} When the Horizon request fails.
+ *
+ * @example
+ * ```typescript
+ * const balances = await getClaimableBalances('GCLAIMANT...');
+ * for (const b of balances) console.log(b.id, b.amount, b.asset);
+ * ```
+ */
+export async function getClaimableBalances(
+  publicKey: string,
+  opts: { networkPassphrase?: string; horizonUrl?: string; limit?: number } = {},
+): Promise<ClaimableBalanceEntry[]> {
+  if (!StrKey.isValidEd25519PublicKey(publicKey)) {
+    throw new Error(`Invalid Stellar public key: ${publicKey}`);
+  }
+  const networkPassphrase = opts.networkPassphrase ?? Networks.PUBLIC;
+  const server = opts.horizonUrl
+    ? new Horizon.Server(opts.horizonUrl)
+    : getServer(networkPassphrase);
+
+  const page = await withTimeout(
+    server
+      .claimableBalances()
+      .claimant(publicKey)
+      .limit(opts.limit ?? 50)
+      .call(),
+  );
+
+  return page.records.map((record) => {
+    const r = record as unknown as {
+      id: string;
+      asset: string;
+      amount: string;
+      sponsor?: string;
+      claimants: Array<{ destination: string; predicate: unknown }>;
+      last_modified_ledger: number;
+    };
+    return {
+      id: r.id,
+      asset: r.asset,
+      amount: r.amount,
+      sponsor: r.sponsor,
+      claimants: r.claimants,
+      lastModifiedLedger: r.last_modified_ledger,
+    };
+  });
 }
 
 // ── SEP-0007 deep-link helpers (#772) ────────────────────────────────────────

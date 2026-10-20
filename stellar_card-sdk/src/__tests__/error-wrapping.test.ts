@@ -13,7 +13,9 @@ import {
   wrapSorobanError,
   wrapHorizonError,
   wrapWalletError,
+  parseApiError,
 } from '../errors';
+import { parseContractError } from '../soroban';
 
 // ── wrapError ────────────────────────────────────────────────────────────────
 
@@ -73,6 +75,31 @@ describe('wrapError', () => {
 // ── wrapNetworkError ──────────────────────────────────────────────────────────
 
 describe('wrapNetworkError', () => {
+  it('preserves a fetch TypeError as the native cause and retains its invocation stack', () => {
+    const failFetch = () => {
+      throw new TypeError('fetch failed');
+    };
+    const failure = (() => {
+      try {
+        failFetch();
+      } catch (error) {
+        return error as TypeError;
+      }
+      throw new Error('Expected fetch to fail');
+    })();
+    const invokeNetworkRequest = () =>
+      wrapNetworkError(failure, 'https://api.stellar_card.com', 'create_order');
+
+    const wrapped = invokeNetworkRequest();
+
+    expect(wrapped).toBeInstanceOf(NetworkError);
+    expect(wrapped.cause).toBe(failure);
+    expect(wrapped.context?.cause).toBe(failure);
+    expect(wrapped.stack?.split('\n')[1]).toContain('invokeNetworkRequest');
+    expect(failure.stack).toContain('error-wrapping.test.ts');
+    expect(failure.stack).not.toContain('wrapNetworkError');
+  });
+
   it('returns a NetworkError with the original message and endpoint', () => {
     const cause = new Error('ECONNREFUSED');
     const wrapped = wrapNetworkError(cause, 'https://api.stellar_card.com', 'create_order');
@@ -105,6 +132,44 @@ describe('wrapNetworkError', () => {
     const wrapped = wrapNetworkError(new Error('DNS lookup failed'));
     expect(wrapped.context?.recoveryHint).toBeTruthy();
     expect(wrapped.context?.recoveryHint).toContain('connection');
+  });
+});
+
+describe('error response and serialization', () => {
+  it('preserves status and the raw JSON body from an RPC error response', () => {
+    const body = {
+      error: 'rpc_unavailable',
+      message: 'RPC is unavailable',
+      details: { retry_after: 3 },
+    };
+    const wrapped = parseApiError(503, body);
+
+    expect(wrapped.status).toBe(503);
+    expect(wrapped.raw).toBe(body);
+    expect(wrapped.toString()).toContain(wrapped.message);
+    expect(JSON.parse(JSON.stringify(wrapped))).toMatchObject({
+      message: 'RPC is unavailable',
+      code: 'rpc_unavailable',
+      status: 503,
+    });
+  });
+
+  it('retains the originating stack and raw trap when wrapping a contract trap', () => {
+    const trap = new Error('Error(Contract, #1)');
+    const invokeContract = () => parseContractError(trap);
+
+    const wrapped = invokeContract();
+
+    expect(wrapped.raw).toBe(trap);
+    expect(wrapped.cause).toBe(trap);
+    expect(wrapped.context?.cause).toBe(trap);
+    expect(trap.stack).toContain('error-wrapping.test.ts');
+    expect(wrapped.stack?.split('\n')[1]).toContain('invokeContract');
+    expect(wrapped.toString()).toContain('ContractExecutionError');
+    expect(JSON.parse(JSON.stringify(wrapped))).toMatchObject({
+      name: 'ContractExecutionError',
+      status: 400,
+    });
   });
 });
 

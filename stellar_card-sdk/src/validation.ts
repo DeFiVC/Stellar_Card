@@ -32,6 +32,7 @@ export const clientOptionsSchema = z
       .optional(),
     headers: z.record(z.string()).optional(),
     disableVersionCheck: z.boolean().optional(),
+    telemetry: z.boolean().optional(),
   })
   .passthrough();
 
