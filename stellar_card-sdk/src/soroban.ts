@@ -15,7 +15,7 @@ import {
   xdr,
   type Transaction,
 } from '@stellar/stellar-sdk';
-import { ContractExecutionError } from './errors';
+import { ContractExecutionError, ValidationError } from './errors';
 import type { Logger } from './logger';
 import type { ContractPaymentResult, TransactionResult } from './types';
 
@@ -186,6 +186,68 @@ export function parseContractError(xdrResult: unknown): ContractExecutionError {
       ? `Unknown contract error: ${xdrResult}`
       : 'Unknown contract error';
   return new ContractExecutionError(0, fallbackExplanation, xdrResult);
+}
+
+// ── Custom base fee overrides (#732) ────────────────────────────────────────
+
+/**
+ * Default base fee, in stroops per operation, used when no client-level
+ * default or per-call override is supplied. Matches Stellar's own
+ * `BASE_FEE` constant (100 stroops).
+ */
+export const DEFAULT_BASE_FEE_STROOPS = 100;
+
+/**
+ * Upper bound on a caller-supplied base fee, in stroops. Callers passing
+ * a `baseFee` above this value get a {@link ValidationError} instead of
+ * silently overpaying — this guards against a typo (e.g. passing the fee
+ * in XLM, or an extra zero) draining an agent's wallet on every transaction.
+ */
+export const MAX_BASE_FEE_STROOPS = 100_000;
+
+let clientDefaultBaseFee: number = DEFAULT_BASE_FEE_STROOPS;
+
+/**
+ * Validate a caller-supplied base fee (stroops). Throws a {@link
+ * ValidationError} when the value is not a positive integer, or exceeds
+ * {@link MAX_BASE_FEE_STROOPS}.
+ */
+export function validateBaseFee(baseFee: number): void {
+  if (!Number.isFinite(baseFee) || !Number.isInteger(baseFee)) {
+    throw new ValidationError('baseFee', `must be an integer number of stroops, got ${baseFee}`);
+  }
+  if (baseFee <= 0) {
+    throw new ValidationError('baseFee', `must be a positive number of stroops, got ${baseFee}`);
+  }
+  if (baseFee > MAX_BASE_FEE_STROOPS) {
+    throw new ValidationError(
+      'baseFee',
+      `must not exceed ${MAX_BASE_FEE_STROOPS} stroops (got ${baseFee}). ` +
+        'This upper bound guards against accidentally overpaying network fees.',
+    );
+  }
+}
+
+/**
+ * Set the client-level default base fee (stroops per operation) used by
+ * {@link buildContractPaymentTx} and {@link payViaContract} when no
+ * per-call `baseFee` override is supplied.
+ *
+ * @throws {ValidationError} When `baseFee` is invalid or exceeds {@link MAX_BASE_FEE_STROOPS}.
+ */
+export function setDefaultBaseFee(baseFee: number): void {
+  validateBaseFee(baseFee);
+  clientDefaultBaseFee = baseFee;
+}
+
+/** Get the current client-level default base fee (stroops). */
+export function getDefaultBaseFee(): number {
+  return clientDefaultBaseFee;
+}
+
+/** Reset the client-level default base fee back to {@link DEFAULT_BASE_FEE_STROOPS} (mainly for tests). */
+export function resetDefaultBaseFee(): void {
+  clientDefaultBaseFee = DEFAULT_BASE_FEE_STROOPS;
 }
 
 const MAINNET_RPC = 'https://mainnet.sorobanrpc.com';
@@ -413,11 +475,24 @@ export interface BuildContractTxOpts {
    */
   preservedSequence?: string;
   /**
-   * Override the fee (stroops). Defaults to BASE_FEE. Set this to the
-   * `requiredFee` from an InsufficientFeeError to retry with the fee
-   * floor the network actually demanded.
+   * Override the fee (stroops) directly, bypassing {@link baseFee}
+   * validation entirely. Used internally by the fee-bump retry in
+   * {@link payViaContract}: set this to the `requiredFee` from an
+   * {@link InsufficientFeeError} to retry with the exact floor the
+   * network demanded. Not validated against {@link MAX_BASE_FEE_STROOPS}
+   * because it originates from the network, not caller input.
    */
   fee?: string;
+  /**
+   * Caller-supplied base fee override, in stroops per operation (#732).
+   * Takes precedence over the client-level default set via
+   * {@link setDefaultBaseFee} for this one call. Validated against
+   * {@link MAX_BASE_FEE_STROOPS} — throws {@link ValidationError} if
+   * invalid or over the bound. Ignored when `fee` is also set (the
+   * fee-bump retry path always wins, since it reflects a network
+   * requirement rather than a preference).
+   */
+  baseFee?: number;
 }
 
 /**
@@ -473,8 +548,17 @@ export async function buildContractPaymentTx(
     nativeToScVal(orderIdBytes, { type: 'bytes' }),
   );
 
+  let resolvedFee: string;
+  if (opts.fee !== undefined) {
+    resolvedFee = opts.fee;
+  } else {
+    const baseFee = opts.baseFee ?? getDefaultBaseFee();
+    validateBaseFee(baseFee);
+    resolvedFee = String(baseFee);
+  }
+
   const raw = new TransactionBuilder(account, {
-    fee: opts.fee ?? BASE_FEE,
+    fee: resolvedFee,
     networkPassphrase: opts.networkPassphrase,
   })
     .addOperation(op)

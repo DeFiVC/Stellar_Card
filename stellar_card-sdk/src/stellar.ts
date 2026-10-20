@@ -18,6 +18,14 @@ import {
   decimalToStroops,
   selectContractCall,
   InsufficientFeeError,
+  validateBaseFee,
+} from './soroban';
+export {
+  setDefaultBaseFee,
+  getDefaultBaseFee,
+  resetDefaultBaseFee,
+  DEFAULT_BASE_FEE_STROOPS,
+  MAX_BASE_FEE_STROOPS,
 } from './soroban';
 import type { ContractPaymentResult } from './types';
 import type { Logger } from './logger';
@@ -91,7 +99,9 @@ export async function estimateXlmRequired(
 ): Promise<XlmEstimateResult> {
   const numUsdc = typeof usdcAmount === 'string' ? parseFloat(usdcAmount) : Number(usdcAmount);
   if (isNaN(numUsdc) || numUsdc <= 0) {
-    throw new Error(`Invalid USDC amount for estimation: ${usdcAmount}. Must be a positive number.`);
+    throw new Error(
+      `Invalid USDC amount for estimation: ${usdcAmount}. Must be a positive number.`,
+    );
   }
 
   const slippage = opts.slippage ?? 0.01;
@@ -103,7 +113,9 @@ export async function estimateXlmRequired(
   let orderbookError: unknown;
 
   try {
-    const server = opts.horizonUrl ? new Horizon.Server(opts.horizonUrl) : getServer(opts.networkPassphrase);
+    const server = opts.horizonUrl
+      ? new Horizon.Server(opts.horizonUrl)
+      : getServer(opts.networkPassphrase);
     const book = await withTimeout(server.orderbook(usdcAsset, xlmAsset).call());
     if (book.asks && book.asks.length > 0) {
       effectiveRate = parseFloat(book.asks[0].price);
@@ -363,6 +375,16 @@ export interface PayOpts {
   horizonUrl?: string;
   /** Optional logger instance */
   logger?: Logger;
+  /**
+   * Per-call base fee override, in stroops per operation (#732). Takes
+   * precedence over the client-level default set via
+   * {@link setDefaultBaseFee} for this one call. Must be a positive
+   * integer no greater than {@link MAX_BASE_FEE_STROOPS} (100,000
+   * stroops) — larger values throw {@link ValidationError} before any
+   * network call is made. Defaults to {@link DEFAULT_BASE_FEE_STROOPS}
+   * (100 stroops) when neither this nor a client-level default is set.
+   */
+  baseFee?: number;
 }
 
 /**
@@ -400,10 +422,18 @@ export async function payViaContract(opts: PayOpts): Promise<ContractPaymentResu
     sorobanRpcUrl,
     horizonUrl,
     logger,
+    baseFee,
   } = opts;
 
   if (!StrKey.isValidContract(payment.contract_id)) {
     throw new Error(`Invalid contract_id in order response: ${payment.contract_id}`);
+  }
+
+  // Validate the per-call override up front — before any network call —
+  // so a bad baseFee fails fast with a clear error instead of surfacing
+  // as a confusing Soroban rejection later.
+  if (baseFee !== undefined) {
+    validateBaseFee(baseFee);
   }
 
   const keypair = Keypair.fromSecret(walletSecret);
@@ -430,6 +460,7 @@ export async function payViaContract(opts: PayOpts): Promise<ContractPaymentResu
       networkPassphrase,
       rpcUrl: sorobanRpcUrl,
       fee,
+      baseFee,
     });
     tx.sign(keypair);
     try {
