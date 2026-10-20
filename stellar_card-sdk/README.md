@@ -134,7 +134,42 @@ const net = resolveNetworkConfigFromEnv({ networkName: 'My Validator' });
 console.log(net.sorobanRpc.url, net.horizon.url);
 ```
 
-## Retry tuning
+## Idempotency
+
+Every call to `createOrder` automatically attaches an `Idempotency-Key` header to the outgoing HTTP request.  This guarantees that if the network drops a response or the SDK retries a `503`, the backend will deduplicate the request and return the **same order** rather than charging twice.
+
+### Automatic key generation
+
+When you call `createOrder` without supplying a key, the SDK generates a UUID v4 for you:
+
+```typescript
+const order = await client.createOrder({ amount_usdc: '10.00' });
+// Idempotency-Key: 3f6c8a27-bc14-4ef2-8b00-3d2f9a1e0a77 (auto-generated)
+```
+
+The auto-generated key is stable across all retry attempts within that single `createOrder` call, so a transient `503` retry is safe by default.
+
+### Caller-supplied key
+
+Pass your own `idempotencyKey` when you want to control deduplication yourself — for example, to make re-runs of a script idempotent even across process restarts:
+
+```typescript
+const order = await client.createOrder({
+  amount_usdc: '10.00',
+  idempotencyKey: 'my-workflow-order-2026-01-15',
+});
+```
+
+If you call `createOrder` again with the same key (in the same process or a fresh one), the backend returns the existing order instead of creating a new charge.
+
+### Key format
+
+- Auto-generated keys are [UUID v4](https://www.rfc-editor.org/rfc/rfc4122) strings.
+- Caller-supplied keys can be any non-empty string that uniquely identifies the intent.
+- The key is sent as the `Idempotency-Key` HTTP request header.
+- The key is **not** included in the request body.
+
+### Retry tuning
 
 ```typescript
 const client = new Stellar_CardClient({
