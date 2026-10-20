@@ -91,7 +91,9 @@ export async function estimateXlmRequired(
 ): Promise<XlmEstimateResult> {
   const numUsdc = typeof usdcAmount === 'string' ? parseFloat(usdcAmount) : Number(usdcAmount);
   if (isNaN(numUsdc) || numUsdc <= 0) {
-    throw new Error(`Invalid USDC amount for estimation: ${usdcAmount}. Must be a positive number.`);
+    throw new Error(
+      `Invalid USDC amount for estimation: ${usdcAmount}. Must be a positive number.`,
+    );
   }
 
   const slippage = opts.slippage ?? 0.01;
@@ -103,7 +105,9 @@ export async function estimateXlmRequired(
   let orderbookError: unknown;
 
   try {
-    const server = opts.horizonUrl ? new Horizon.Server(opts.horizonUrl) : getServer(opts.networkPassphrase);
+    const server = opts.horizonUrl
+      ? new Horizon.Server(opts.horizonUrl)
+      : getServer(opts.networkPassphrase);
     const book = await withTimeout(server.orderbook(usdcAsset, xlmAsset).call());
     if (book.asks && book.asks.length > 0) {
       effectiveRate = parseFloat(book.asks[0].price);
@@ -239,6 +243,75 @@ export interface AccountBalances {
   balances: AssetBalance[];
   /** `false` when the account does not exist on-chain yet. */
   funded: boolean;
+}
+
+/** Account and optional memo returned by a SEP-0002 federation lookup. */
+export interface FederationAddressResolution {
+  accountId: string;
+  memo?: string;
+  memoType?: 'id' | 'text' | 'hash' | 'return';
+}
+
+/** Check whether a string is a valid Stellar account or Soroban contract address. */
+export function isValidStellarAddress(address: string): boolean {
+  return (
+    typeof address === 'string' &&
+    (StrKey.isValidEd25519PublicKey(address) || StrKey.isValidContract(address))
+  );
+}
+
+/**
+ * Resolve a SEP-0002 federation address such as `alice*stellarcard.com`.
+ *
+ * @throws {Error} If the address is malformed, lookup fails, or the federation
+ * response does not contain a matching valid account and memo.
+ */
+export async function resolveFederationAddress(
+  fedAddress: string,
+): Promise<FederationAddressResolution> {
+  const match = /^([^*\s]+)\*([A-Za-z0-9.-]+)$/.exec(fedAddress);
+  if (
+    !match ||
+    match[2].split('.').some((label) => !/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(label))
+  ) {
+    throw new Error(`Invalid federation address: ${fedAddress}`);
+  }
+
+  const url = `https://${match[2]}/federation?type=name&q=${encodeURIComponent(fedAddress)}`;
+  const response = await fetch(url, { headers: { Accept: 'application/json' } });
+  if (!response.ok) {
+    throw new Error(`Federation lookup failed with HTTP ${response.status}`);
+  }
+
+  const result: unknown = await response.json();
+  if (typeof result !== 'object' || result === null) {
+    throw new Error('Invalid federation response');
+  }
+
+  const body = result as Record<string, unknown>;
+  if (
+    body.stellar_address !== fedAddress ||
+    typeof body.account_id !== 'string' ||
+    !StrKey.isValidEd25519PublicKey(body.account_id)
+  ) {
+    throw new Error('Federation response contains an invalid address or account ID');
+  }
+
+  const resolution: FederationAddressResolution = { accountId: body.account_id };
+  if (body.memo !== undefined || body.memo_type !== undefined) {
+    const validMemoTypes = ['id', 'text', 'hash', 'return'];
+    if (
+      typeof body.memo !== 'string' ||
+      typeof body.memo_type !== 'string' ||
+      !validMemoTypes.includes(body.memo_type)
+    ) {
+      throw new Error('Federation response contains invalid memo details');
+    }
+    resolution.memo = body.memo;
+    resolution.memoType = body.memo_type as FederationAddressResolution['memoType'];
+  }
+
+  return resolution;
 }
 
 /** How long balance lookups are cached, in ms. */
