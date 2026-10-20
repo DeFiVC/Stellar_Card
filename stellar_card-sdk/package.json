@@ -34,6 +34,11 @@
       "types": "./dist/ows.d.ts",
       "import": "./dist/esm/ows.js",
       "require": "./dist/ows.js"
+    },
+    "./hardware": {
+      "types": "./dist/hardware.d.ts",
+      "import": "./dist/esm/hardware.js",
+      "require": "./dist/hardware.js"
     }
   },
   "browser": {
@@ -112,6 +117,9 @@
       ],
       "ows": [
         "./dist/ows.d.ts"
+      ],
+      "hardware": [
+        "./dist/hardware.d.ts"
       ]
     }
   },
