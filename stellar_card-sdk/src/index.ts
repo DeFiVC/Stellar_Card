@@ -336,3 +336,11 @@ export {
   isPendingOrder,
   isFailedOrder,
 } from './types';
+
+// Webhook signature verification helper (#717)
+export {
+  verifyWebhookSignature,
+  WebhookVerificationError,
+  type VerifyWebhookOptions,
+  type WebhookVerificationFailureReason,
+} from './webhook';
