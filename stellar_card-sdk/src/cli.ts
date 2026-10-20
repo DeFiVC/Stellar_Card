@@ -54,6 +54,8 @@ Usage:
   stellar_card status [--order <id>]     Show orders as a table (--json for raw JSON)
   stellar_card balance                   Show the api key's spend budget (--json)
   stellar_card batch-order --file <csv>  Create orders from CSV and export a summary
+  stellar_card logs [--action <name>]    Show recent audit log / transaction history
+                    [--limit <n>] [--tail]   (--action/--limit filter, --tail follows live, --json for raw JSON)
   stellar_card verify-tx <hash> --treasury <G…>
                                      Cryptographically verify an on-chain payment proof
   stellar_card doctor [--contract <C…>]
@@ -109,6 +111,18 @@ Onboarding guide for agents: https://stellar_card.com/skill.md
   if (cmd === 'batch-order') {
     const { batchOrderCommand } = await import('./commands/batch-order');
     return batchOrderCommand(rest);
+  }
+
+  if (cmd === 'logs') {
+    const { logsCommand } = await import('./commands/logs');
+    const controller = new AbortController();
+    const onSigint = (): void => controller.abort();
+    process.once('SIGINT', onSigint);
+    try {
+      return await logsCommand(rest, { signal: controller.signal });
+    } finally {
+      process.removeListener('SIGINT', onSigint);
+    }
   }
 
   if (cmd === 'verify-tx' || cmd === 'verify') {
