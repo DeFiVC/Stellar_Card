@@ -39,6 +39,11 @@
       "types": "./dist/hardware.d.ts",
       "import": "./dist/esm/hardware.js",
       "require": "./dist/hardware.js"
+    },
+    "./mock": {
+      "types": "./dist/mock.d.ts",
+      "import": "./dist/esm/mock.js",
+      "require": "./dist/mock.js"
     }
   },
   "browser": {
@@ -120,6 +125,9 @@
       ],
       "hardware": [
         "./dist/hardware.d.ts"
+      ],
+      "mock": [
+        "./dist/mock.d.ts"
       ]
     }
   },
