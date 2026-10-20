@@ -34,7 +34,7 @@ export class Stellar_CardError extends Error {
     public readonly raw?: unknown,
     public readonly context?: ErrorContext,
   ) {
-    super(message);
+    super(message, context?.cause ? { cause: context.cause } : undefined);
     this.name = 'Stellar_CardError';
     Object.setPrototypeOf(this, new.target.prototype);
   }
@@ -577,11 +577,13 @@ export function wrapNetworkError(
   operation?: string,
 ): NetworkError {
   const message = err instanceof Error ? err.message : 'Unknown network error';
-  return new NetworkError(message, endpoint, err instanceof Error ? err : undefined, {
+  const wrapped = new NetworkError(message, endpoint, err instanceof Error ? err : undefined, {
     recoveryHint:
       'Check your internet connection, firewall rules, and that the endpoint is reachable.',
     operation,
   });
+  if (Error.captureStackTrace) Error.captureStackTrace(wrapped, wrapNetworkError);
+  return wrapped;
 }
 
 /**
