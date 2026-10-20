@@ -50,6 +50,10 @@ export type {
 export { BrowserKeystore, createKeystore } from './keystore';
 export type { EncryptedKeystore } from './keystore';
 
+// WebCrypto utilities — browser-compatible cryptographic key derivation and HMAC (#695)
+export { deriveKeyWithWebCrypto, hmacWithWebCrypto, assertSafeBaseUrl } from './config.browser';
+export type { Stellar_CardConfig } from './config.browser';
+
 // Network configuration helpers — pure functions, no Node.js deps.
 
 // `resolveNetworkConfigFromEnv` guards its `process.env` access so it is safe

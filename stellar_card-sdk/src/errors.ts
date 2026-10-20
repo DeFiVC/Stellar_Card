@@ -34,7 +34,7 @@ export class Stellar_CardError extends Error {
     public readonly raw?: unknown,
     public readonly context?: ErrorContext,
   ) {
-    super(message);
+    super(message, context?.cause ? { cause: context.cause } : undefined);
     this.name = 'Stellar_CardError';
     Object.setPrototypeOf(this, new.target.prototype);
   }
@@ -340,6 +340,25 @@ export class ValidationError extends Stellar_CardError {
   }
 }
 
+/** Invalid memo value or memo type passed to {@link buildTransactionMemo}. */
+export class InvalidMemoError extends Stellar_CardError {
+  constructor(
+    public readonly memoType: string,
+    reason: string,
+    context?: ErrorContext,
+  ) {
+    super(
+      `Invalid memo (type "${memoType}"): ${reason}`,
+      'invalid_memo',
+      400,
+      { memoType, reason },
+      context,
+    );
+    this.name = 'InvalidMemoError';
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
 /** Soroban RPC error. */
 export class SorobanRpcError extends Stellar_CardError {
   constructor(
@@ -577,11 +596,13 @@ export function wrapNetworkError(
   operation?: string,
 ): NetworkError {
   const message = err instanceof Error ? err.message : 'Unknown network error';
-  return new NetworkError(message, endpoint, err instanceof Error ? err : undefined, {
+  const wrapped = new NetworkError(message, endpoint, err instanceof Error ? err : undefined, {
     recoveryHint:
       'Check your internet connection, firewall rules, and that the endpoint is reachable.',
     operation,
   });
+  if (Error.captureStackTrace) Error.captureStackTrace(wrapped, wrapNetworkError);
+  return wrapped;
 }
 
 /**

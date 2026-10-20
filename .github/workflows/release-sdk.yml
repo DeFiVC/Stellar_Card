@@ -1,0 +1,53 @@
+name: Release SDK
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "stellar_card-sdk/**"
+      - ".github/workflows/release-sdk.yml"
+
+concurrency:
+  group: release-sdk
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Version or publish SDK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+          cache-dependency-path: stellar_card-sdk/package-lock.json
+          registry-url: https://registry.npmjs.org
+
+      - name: Install SDK dependencies
+        working-directory: stellar_card-sdk
+        run: npm ci
+
+      - name: Create Version PR or publish release
+        uses: changesets/action@v1
+        with:
+          cwd: stellar_card-sdk
+          publish-script: npx changeset publish
+          commit-message: "chore: version packages"
+          pr-title: "chore: version packages"
+          create-github-releases: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"

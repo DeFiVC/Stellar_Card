@@ -170,6 +170,72 @@ If you call `createOrder` again with the same key (in the same process or a fres
 - The key is **not** included in the request body.
 
 ### Retry tuning
+## Claimable balances (escrow with timelocks)
+
+Escrow XLM or an asset on-chain for a claimant, optionally restricted by a before/after timestamp predicate, using `createClaimableBalance` / `claimBalance` from `stellar_card/stellar`:
+
+```typescript
+import { createClaimableBalance, claimBalance, getClaimableBalances } from 'stellar_card';
+
+// Escrow 10 XLM, claimable only on/after 2027-01-01.
+const txHash = await createClaimableBalance({
+  sourceSecret: process.env.STELLAR_SECRET!,
+  amount: '10.0000000',
+  claimants: [
+    {
+      destination: 'GCLAIMANT...',
+      predicate: { afterAbsoluteTime: '2027-01-01T00:00:00Z' },
+    },
+  ],
+});
+
+// The claimant finds and claims their balance once the predicate is satisfied.
+const balances = await getClaimableBalances('GCLAIMANT...');
+await claimBalance(balances[0].id, process.env.CLAIMANT_SECRET!);
+```
+
+`predicate` supports `beforeAbsoluteTime`, `afterAbsoluteTime`, both combined, or `unconditional` (the default when omitted).
+
+## Transaction memos
+
+`buildTransactionMemo` constructs a type-safe Stellar `Memo` for the `text`, `id`, `hash`, and `return` variants, validating constraints up front (e.g. `text` is checked against its real UTF-8 **byte** length, not character count) and throwing `InvalidMemoError` on violation:
+
+```typescript
+import { buildTransactionMemo } from 'stellar_card';
+
+const memo = buildTransactionMemo('text', 'order-4821'); // max 28 UTF-8 bytes
+const idMemo = buildTransactionMemo('id', 42);
+const hashMemo = buildTransactionMemo('hash', Buffer.alloc(32)); // or a 64-char hex string
+
+const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase })
+  .addMemo(memo)
+  .addOperation(/* ... */)
+  .setTimeout(300)
+  .build();
+```
+
+## Hardware wallet signing (Ledger)
+
+`stellar_card/hardware` provides a `LedgerStellarSigner` abstraction for signing with a Ledger device over WebUSB, using the Stellar BIP-44 path `m/44'/148'/0'`. It's built against the documented API shape of `@ledgerhq/hw-transport-webusb` + `@ledgerhq/hw-app-str` without requiring either as a dependency — pass in real instances of those clients, or any object matching the same shape:
+
+```typescript
+import TransportWebUSB from '@ledgerhq/hw-transport-webusb';
+import Str from '@ledgerhq/hw-app-str';
+import { createLedgerStellarSigner, createWebUsbTransport } from 'stellar_card/hardware';
+
+const transport = await createWebUsbTransport(() => TransportWebUSB.create());
+const signer = createLedgerStellarSigner({ transport, app: new Str(transport) });
+
+const address = await signer.getPublicKey({ display: true }); // shows + confirms on-device
+const signedTx = await signer.signTransaction(unsignedTx); // user reviews treasury/amount/asset on-device
+await signer.disconnect();
+```
+
+Connection failures, user rejection, a locked device, and timeouts each surface as a distinct `LedgerSignerError` with a typed `reason` (`'device_not_connected' | 'device_locked' | 'wrong_app' | 'user_rejected' | 'timeout' | 'transport_error' | 'unsupported_environment'`) so you can branch on the failure mode instead of parsing error strings.
+
+> **Testing disclosure:** this signer is unit-tested only against a mocked Ledger transport/app (see `src/__tests__/hardware-signer.test.ts`). It has not been exercised against real Ledger hardware in this environment.
+
+## Retry tuning
 
 ```typescript
 const client = new Stellar_CardClient({

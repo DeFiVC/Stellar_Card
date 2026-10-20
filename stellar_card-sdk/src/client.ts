@@ -31,6 +31,13 @@ import {
 } from './network';
 import { validateClientOptions, validateCreateOrderInput } from './validation';
 import type { AccountBalances } from './stellar';
+import {
+  createTelemetryCollector,
+  createTelemetryEndpoint,
+  isTelemetryEnabled,
+  type TelemetryCollector,
+  type TelemetryFeature,
+} from './telemetry';
 
 export type { RequestOptions } from './network';
 
@@ -214,6 +221,8 @@ export interface StellarCardClientOptions {
   headers?: Record<string, string>;
   /** Disable automatic startup SDK version checking. */
   disableVersionCheck?: boolean;
+  /** Enable anonymous SDK telemetry. Disabled unless explicitly opted in. */
+  telemetry?: boolean;
 }
 
 export interface WaitForOrderFulfillmentOptions extends RequestOptions {
@@ -267,6 +276,7 @@ export class Stellar_CardClient {
   private timeout: number;
   private network: 'mainnet' | 'testnet' | 'futurenet';
   private headers: Record<string, string>;
+  private telemetry: TelemetryCollector;
 
   /**
    * Create a client from explicit options, env vars, or on-disk config.
@@ -361,6 +371,10 @@ export class Stellar_CardClient {
     }
     this.baseUrl = finalBase.replace(/\/$/, '');
     this.apiKey = resolvedKey;
+    this.telemetry = createTelemetryCollector({
+      enabled: isTelemetryEnabled(options.telemetry),
+      endpoint: createTelemetryEndpoint(this.baseUrl),
+    });
     // Audit A-23: default to retry on transient errors so every agent doesn't
     // reimplement its own backoff loop. 2 retries with 500ms base + 5s cap
     // covers brief network blips without punishing a persistent outage.
@@ -390,6 +404,7 @@ export class Stellar_CardClient {
     url: string,
     init: RequestInit,
     { timeout = this.timeout, signal, headers: reqHeaders }: RequestOptions = {},
+    telemetryFeature: TelemetryFeature = 'api_request',
   ): Promise<Response> {
     const { attempts, baseDelayMs, maxDelayMs, jitter, onRetry } = this.retry;
     const operation = `${init.method ?? 'GET'} ${url}`;
@@ -414,6 +429,7 @@ export class Stellar_CardClient {
           },
         );
         if (res.ok || !this.shouldRetry(res.status) || i === attempts) {
+          if (!res.ok) this.telemetry.recordFeatureError(telemetryFeature);
           this.logger.debug(`HTTP ${res.status} for ${init.method ?? 'GET'} ${url}`);
           return res;
         }
@@ -439,6 +455,7 @@ export class Stellar_CardClient {
         // Timeouts and caller aborts are final — never retried.
         if (err instanceof TimeoutError || err instanceof AbortError) throw err;
         if (i === attempts) {
+          this.telemetry.recordFeatureError(telemetryFeature);
           this.logger.error(`HTTP request to ${url} failed after ${attempts} retries`, {
             error: err,
           });
@@ -499,6 +516,7 @@ export class Stellar_CardClient {
         body: JSON.stringify(body),
       },
       { timeout, signal },
+      'orders',
     );
     if (!res.ok) return this.handleError(res);
     return res.json() as Promise<OrderResponse>;
@@ -521,6 +539,7 @@ export class Stellar_CardClient {
       `${this.baseUrl}/orders/${encodeURIComponent(orderId)}`,
       { headers: { 'X-Api-Key': this.apiKey } },
       reqOpts,
+      'orders',
     );
     if (!res.ok) return this.handleError(res);
     return res.json() as Promise<OrderStatus>;
@@ -834,6 +853,7 @@ export class Stellar_CardClient {
       `${this.baseUrl}/orders${qs}`,
       { headers: { 'X-Api-Key': this.apiKey } },
       { timeout, signal },
+      'orders',
     );
     if (!res.ok) return this.handleError(res);
     return res.json() as Promise<OrderListItem[]>;
@@ -1009,4 +1029,3 @@ export class Stellar_CardClient {
     return getAccountBalances(publicKey, passphrase);
   }
 }
-

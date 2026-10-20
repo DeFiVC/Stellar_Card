@@ -42,6 +42,8 @@ export {
   payViaContract,
   purchaseCard,
   estimateXlmRequired,
+  isValidStellarAddress,
+  resolveFederationAddress,
   signMessage,
   verifyMessage,
   // Re-export from this barrel to keep external imports stable even if
@@ -52,15 +54,30 @@ export {
   buildSep7PayUri,
   buildSep7TxUri,
   parseSep7Uri,
+  // Claimable balances (#736)
+  createClaimableBalance,
+  claimBalance,
+  getClaimableBalances,
+  // Transaction memo builder (#739)
+  buildTransactionMemo,
+  MEMO_TEXT_MAX_BYTES,
+  MEMO_HASH_BYTES,
+  MEMO_ID_MAX,
 } from './stellar';
 export type {
   WalletInfo,
   PayOpts,
   EstimateXlmOptions,
   XlmEstimateResult,
+  FederationAddressResolution,
   Sep7PayParams,
   Sep7TxParams,
   Sep7ParsedUri,
+  ClaimPredicate,
+  ClaimableBalanceClaimant,
+  CreateClaimableBalanceOpts,
+  ClaimableBalanceEntry,
+  MemoType,
 } from './stellar';
 
 export { getAccountBalances, clearBalanceCache, BALANCE_CACHE_TTL_MS } from './stellar';
@@ -114,6 +131,7 @@ export {
   SorobanRpcError,
   HorizonError,
   WalletError,
+  InvalidMemoError,
   parseApiError,
   wrapError,
   wrapValidationError,
@@ -188,7 +206,6 @@ export {
   TESTNET_USDC_SAC,
 } from './config';
 export type { Stellar_CardConfig, NetworkDetectionOptions, DetectedNetworkConfig } from './config';
-
 
 export {
   paginate,
@@ -292,6 +309,13 @@ export type {
   OrderEventSubscription,
   OrderHistoryEntry,
   OrderHistoryResponse,
+  // Order status discriminated union (#729)
+  OrderCard,
+  OrderStatusLiteral,
+  ActiveOrder,
+  PendingOrder,
+  FailedOrder,
+  Order,
 } from './types';
 
 export {
@@ -307,4 +331,16 @@ export {
   isOrderEvent,
   isWebhookDelivery,
   isOrderEventSubscription,
+  // Order status type guards (#729)
+  isActiveOrder,
+  isPendingOrder,
+  isFailedOrder,
 } from './types';
+
+// Webhook signature verification helper (#717)
+export {
+  verifyWebhookSignature,
+  WebhookVerificationError,
+  type VerifyWebhookOptions,
+  type WebhookVerificationFailureReason,
+} from './webhook';

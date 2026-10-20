@@ -9,6 +9,7 @@
 //              client's config "just works").
 //   status     List orders (or one with --order) as a colorized table.
 //   balance    Show the api key's budget / spend summary.
+//   batch-order Create multiple orders from a CSV file.
 //   verify-tx  Cryptographically verify an on-chain payment proof.
 //   version    Print the installed SDK version and exit.
 //
@@ -52,8 +53,11 @@ Usage:
                                      the wallet can receive USDC)
   stellar_card status [--order <id>]     Show orders as a table (--json for raw JSON)
   stellar_card balance                   Show the api key's spend budget (--json)
+  stellar_card batch-order --file <csv>  Create orders from CSV and export a summary
   stellar_card verify-tx <hash> --treasury <G…>
                                      Cryptographically verify an on-chain payment proof
+  stellar_card doctor [--contract <C…>]
+                                     Check local runtime, backend, Stellar endpoints, and contract
   stellar_card logout                    Clear cached session tokens and api keys
   stellar_card cache clear               Clear local cached state (same as logout)
   stellar_card mcp                       Start the MCP server over stdio (default)
@@ -102,14 +106,29 @@ Onboarding guide for agents: https://stellar_card.com/skill.md
     return balanceCommand(rest);
   }
 
+  if (cmd === 'batch-order') {
+    const { batchOrderCommand } = await import('./commands/batch-order');
+    return batchOrderCommand(rest);
+  }
+
   if (cmd === 'verify-tx' || cmd === 'verify') {
     const { verifyTxCommand } = await import('./commands/verify');
     return verifyTxCommand(rest);
   }
 
+  if (cmd === 'doctor') {
+    const { doctorCommand } = await import('./commands/doctor');
+    return doctorCommand(rest);
+  }
+
   if (cmd === 'wallet') {
     const { walletCommand } = await import('./commands/wallet');
     return walletCommand(rest);
+  }
+
+  if (cmd === 'profile') {
+    const { profileCommand } = await import('./commands/profile');
+    return profileCommand(rest);
   }
 
   if (cmd === 'logout' || cmd === 'cache-clear' || cmd === 'cache') {
