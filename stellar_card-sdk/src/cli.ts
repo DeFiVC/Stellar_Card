@@ -9,6 +9,7 @@
 //              client's config "just works").
 //   status     List orders (or one with --order) as a colorized table.
 //   balance    Show the api key's budget / spend summary.
+//   batch-order Create multiple orders from a CSV file.
 //   verify-tx  Cryptographically verify an on-chain payment proof.
 //   version    Print the installed SDK version and exit.
 //
@@ -52,6 +53,7 @@ Usage:
                                      the wallet can receive USDC)
   stellar_card status [--order <id>]     Show orders as a table (--json for raw JSON)
   stellar_card balance                   Show the api key's spend budget (--json)
+  stellar_card batch-order --file <csv>  Create orders from CSV and export a summary
   stellar_card verify-tx <hash> --treasury <G…>
                                      Cryptographically verify an on-chain payment proof
   stellar_card logout                    Clear cached session tokens and api keys
@@ -100,6 +102,11 @@ Onboarding guide for agents: https://stellar_card.com/skill.md
   if (cmd === 'balance') {
     const { balanceCommand } = await import('./commands/status');
     return balanceCommand(rest);
+  }
+
+  if (cmd === 'batch-order') {
+    const { batchOrderCommand } = await import('./commands/batch-order');
+    return batchOrderCommand(rest);
   }
 
   if (cmd === 'verify-tx' || cmd === 'verify') {

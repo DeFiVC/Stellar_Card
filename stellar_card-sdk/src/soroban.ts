@@ -175,17 +175,22 @@ export function extractContractErrorCode(xdrResult: unknown): number | null {
  */
 export function parseContractError(xdrResult: unknown): ContractExecutionError {
   const code = extractContractErrorCode(xdrResult);
+  const context = xdrResult instanceof Error ? { cause: xdrResult } : undefined;
 
   if (code !== null) {
     const explanation = CONTRACT_ERROR_MESSAGES[code] ?? `Unknown custom contract error: ${code}`;
-    return new ContractExecutionError(code, explanation, xdrResult);
+    const wrapped = new ContractExecutionError(code, explanation, xdrResult, context);
+    if (Error.captureStackTrace) Error.captureStackTrace(wrapped, parseContractError);
+    return wrapped;
   }
 
   const fallbackExplanation =
     typeof xdrResult === 'string'
       ? `Unknown contract error: ${xdrResult}`
       : 'Unknown contract error';
-  return new ContractExecutionError(0, fallbackExplanation, xdrResult);
+  const wrapped = new ContractExecutionError(0, fallbackExplanation, xdrResult, context);
+  if (Error.captureStackTrace) Error.captureStackTrace(wrapped, parseContractError);
+  return wrapped;
 }
 
 const MAINNET_RPC = 'https://mainnet.sorobanrpc.com';
