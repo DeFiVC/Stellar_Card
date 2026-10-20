@@ -593,6 +593,112 @@ export function verifyMessage(
   }
 }
 
+// ── Offline transaction signing for cold storage wallets ──────────────────────
+
+export interface UnsignedTransactionEnvelope {
+  /** XDR transaction envelope (unsigned). */
+  xdr: string;
+  /** Network passphrase for this transaction. */
+  networkPassphrase: string;
+  /** Fee allocated to the transaction (stroops). */
+  fee: string;
+  /** Sequence number of the signing account. */
+  sequence: string;
+}
+
+/**
+ * Build an unsigned Soroban transaction envelope for offline signing by a cold storage wallet.
+ *
+ * Returns a {@link UnsignedTransactionEnvelope} containing the XDR serialization,
+ * network context, and metadata needed to sign offline. The envelope can be exported,
+ * signed with a hardware wallet or air-gapped signing tool, and then resubmitted
+ * using {@link submitSignedTransaction}.
+ *
+ * @param opts - Transaction build options (same as {@link buildContractPaymentTx})
+ * @returns An unsigned transaction envelope ready for offline signing
+ * @throws {Error} If Soroban RPC simulation fails
+ *
+ * @example
+ * ```typescript
+ * // Build envelope on an online computer
+ * const envelope = await buildUnsignedTransactionEnvelope({
+ *   contractId: 'CXXXX...',
+ *   fn: 'pay_usdc',
+ *   fromPublicKey: coldStoragePublicKey,
+ *   amountStroops: decimalToStroops('10.00'),
+ *   orderId: 'ord_abc123',
+ *   networkPassphrase: Networks.TESTNET,
+ * });
+ *
+ * // Export and sign offline...
+ * // const signedXdr = signWithHardwareWallet(envelope.xdr);
+ *
+ * // Submit signed transaction from any online computer
+ * // const result = await submitSignedTransaction(signedXdr, envelope.networkPassphrase);
+ * ```
+ */
+export async function buildUnsignedTransactionEnvelope(
+  opts: Omit<Parameters<typeof buildContractPaymentTx>[0], 'fee'> & {
+    fee?: string;
+  },
+): Promise<UnsignedTransactionEnvelope> {
+  const { tx } = await buildContractPaymentTx(opts as Parameters<typeof buildContractPaymentTx>[0]);
+  return {
+    xdr: tx.toXDR(),
+    networkPassphrase: opts.networkPassphrase,
+    fee: String(tx.fee ?? BASE_FEE),
+    sequence: tx.sequence,
+  };
+}
+
+/**
+ * Submit a previously signed transaction that was built offline.
+ *
+ * Takes a signed transaction XDR (from offline signing) and submits it to the
+ * Soroban RPC endpoint. Polls until the transaction reaches a terminal status
+ * and returns the result with fee refund metrics.
+ *
+ * @param signedXdr - The signed transaction XDR string from offline signing
+ * @param networkPassphrase - Network this transaction was built for
+ * @param sorobanRpcUrl - Optional Soroban RPC URL override
+ * @param horizonUrl - Optional Horizon URL override for fallback confirmation
+ * @returns Transaction result with hash and fee metrics
+ * @throws {Error} If the transaction fails on-chain or parsing fails
+ *
+ * @example
+ * ```typescript
+ * const result = await submitSignedTransaction(
+ *   signedXdr,
+ *   Networks.TESTNET,
+ *   undefined, // use default Soroban RPC for TESTNET
+ *   'https://horizon-testnet.stellar.org'
+ * );
+ * console.log('Submitted:', result.hash);
+ * ```
+ */
+export async function submitSignedTransaction(
+  signedXdr: string,
+  networkPassphrase: string,
+  sorobanRpcUrl?: string,
+  horizonUrl?: string,
+): Promise<ContractPaymentResult> {
+  const { submitSorobanTx, getSorobanRpcUrl, getHorizonUrl } = await import('./soroban');
+  const { rpc } = await import('@stellar/stellar-sdk');
+
+  const resolvedRpcUrl = sorobanRpcUrl ?? getSorobanRpcUrl(networkPassphrase);
+  const resolvedHorizonUrl = horizonUrl ?? getHorizonUrl(networkPassphrase);
+  const server = new rpc.Server(resolvedRpcUrl);
+  const tx = rpc.Api.Transaction.fromXDR(signedXdr, networkPassphrase) as any;
+
+  const result = await submitSorobanTx(tx, server, resolvedHorizonUrl);
+  return {
+    hash: result.hash,
+    feeCharged: result.feeCharged ?? result.maxFee ?? String(tx.fee ?? BASE_FEE),
+    feeRefunded: result.feeRefunded ?? '0',
+    maxFee: result.maxFee ?? String(tx.fee ?? BASE_FEE),
+  };
+}
+
 // ── SEP-0007 deep-link helpers (#772) ────────────────────────────────────────
 // Re-exported here so consumers can `import { buildSep7PayUri } from 'stellar_card'`
 // without reaching into the utils/ path.
