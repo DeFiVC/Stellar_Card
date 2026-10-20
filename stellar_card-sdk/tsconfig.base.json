@@ -10,8 +10,12 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "moduleDetection": "force",
-    "lib": ["ES2022"],
+    "lib": ["ES2022", "DOM"],
     "target": "ES2022",
+    // Used by src/integrations/react.tsx (tests) — the hook implementation
+    // itself avoids JSX syntax so the public surface doesn't require a
+    // JSX-aware bundler config to type-check (see react.ts).
+    "jsx": "react-jsx",
     // TS 6.0 emits TS5107 (an error) for moduleResolution=node10 (the
     // legacy 'node' value). The SDK still uses that and a proper
     // migration to 'node16' requires adding .js extensions to every
