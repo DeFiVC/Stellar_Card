@@ -340,6 +340,25 @@ export class ValidationError extends Stellar_CardError {
   }
 }
 
+/** Invalid memo value or memo type passed to {@link buildTransactionMemo}. */
+export class InvalidMemoError extends Stellar_CardError {
+  constructor(
+    public readonly memoType: string,
+    reason: string,
+    context?: ErrorContext,
+  ) {
+    super(
+      `Invalid memo (type "${memoType}"): ${reason}`,
+      'invalid_memo',
+      400,
+      { memoType, reason },
+      context,
+    );
+    this.name = 'InvalidMemoError';
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
 /** Soroban RPC error. */
 export class SorobanRpcError extends Stellar_CardError {
   constructor(

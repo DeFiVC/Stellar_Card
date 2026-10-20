@@ -52,6 +52,15 @@ export {
   buildSep7PayUri,
   buildSep7TxUri,
   parseSep7Uri,
+  // Claimable balances (#736)
+  createClaimableBalance,
+  claimBalance,
+  getClaimableBalances,
+  // Transaction memo builder (#739)
+  buildTransactionMemo,
+  MEMO_TEXT_MAX_BYTES,
+  MEMO_HASH_BYTES,
+  MEMO_ID_MAX,
 } from './stellar';
 export type {
   WalletInfo,
@@ -61,6 +70,11 @@ export type {
   Sep7PayParams,
   Sep7TxParams,
   Sep7ParsedUri,
+  ClaimPredicate,
+  ClaimableBalanceClaimant,
+  CreateClaimableBalanceOpts,
+  ClaimableBalanceEntry,
+  MemoType,
 } from './stellar';
 
 export { getAccountBalances, clearBalanceCache, BALANCE_CACHE_TTL_MS } from './stellar';
@@ -114,6 +128,7 @@ export {
   SorobanRpcError,
   HorizonError,
   WalletError,
+  InvalidMemoError,
   parseApiError,
   wrapError,
   wrapValidationError,
@@ -188,7 +203,6 @@ export {
   TESTNET_USDC_SAC,
 } from './config';
 export type { Stellar_CardConfig, NetworkDetectionOptions, DetectedNetworkConfig } from './config';
-
 
 export {
   paginate,
