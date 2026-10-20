@@ -168,14 +168,73 @@ describe('purchaseCardOWS resume state machine — F1-resume', () => {
     landedResult: 'landed' | 'dropped' | 'pending';
   }) {
     const getOrderSpy = vi.fn().mockResolvedValue(opts.orderStatus);
-    const checkLandedSpy = vi.fn().mockResolvedValue(opts.landedResult);
     const waitForCardSpy = vi
       .fn()
       .mockResolvedValue({ number: '4111', cvv: '123', expiry: '12/30', brand: 'Visa' });
-    const payViaContractOWSSpy = vi.fn().mockResolvedValue('fake-resubmit-tx-hash');
+    // `checkSorobanTxLanded` (ows.ts) hits Horizon via the global `fetch`
+    // directly — stub fetch rather than the export, since ows.ts calls it
+    // through its own module-local binding (vi.spyOn on the export object
+    // does not intercept a module's calls to its own functions).
+    const horizonFetchSpy = vi.fn(async () => {
+      if (opts.landedResult === 'landed') {
+        return new Response(JSON.stringify({ successful: true }), { status: 200 });
+      }
+      if (opts.landedResult === 'dropped') {
+        return new Response('not found', { status: 404 });
+      }
+      // 'pending' — an ambiguous non-200/404 Horizon response.
+      return new Response('service unavailable', { status: 503 });
+    });
+    vi.stubGlobal('fetch', horizonFetchSpy);
 
-    // Patch the modules purchaseCardOWS imports. vi.doMock must come
-    // before the dynamic import of ows.ts.
+    // `payViaContractOWS` (ows.ts) calls `submitSorobanTx` /
+    // `buildContractPaymentTx` from ./soroban — a DIFFERENT module, so
+    // mocking it here genuinely intercepts ows.ts's calls (unlike trying
+    // to mock ows.ts's own exports from within itself).
+    const submitSorobanTxSpy = vi.fn().mockResolvedValue({
+      hash: 'fake-resubmit-tx-hash',
+      feeCharged: '100',
+      feeRefunded: '0',
+      maxFee: '100',
+    });
+    // Minimal fake Transaction: owsSignTx only needs `.toEnvelope().toXDR()`
+    // (to build the signing payload) and a mutable `.signatures` array to
+    // push the decorated signature onto — it never inspects XDR contents
+    // in this test, so a fixed dummy envelope is fine.
+    const fakeTx = {
+      sequence: '1',
+      fee: '100',
+      signatures: [] as unknown[],
+      toEnvelope: () => ({ toXDR: () => '00'.repeat(32) }),
+    };
+    const buildContractPaymentTxSpy = vi.fn().mockResolvedValue({
+      tx: fakeTx,
+      server: {},
+    });
+    vi.doMock('../soroban', async () => {
+      const actual = await vi.importActual<typeof import('../soroban')>('../soroban');
+      return {
+        ...actual,
+        submitSorobanTx: submitSorobanTxSpy,
+        buildContractPaymentTx: buildContractPaymentTxSpy,
+      };
+    });
+
+    // `getOWSPublicKey` / `getOWSBalance` (ows.ts) call out to
+    // `@ctx.com/stellar-ows-core` (owsGet/owsSign) and
+    // `@stellar/stellar-sdk`'s `Horizon.Server` — both external
+    // packages, so mocking them intercepts ows.ts's real calls.
+    const TEST_PUBLIC_KEY = 'GCY5PWJB77OWDLLJ7QLW3KZUKFQSNGZVAOCP4XEWIUORVCKVJBDNR5FK';
+    vi.doMock('@ctx.com/stellar-ows-core', () => ({
+      createWallet: vi.fn(),
+      getWallet: vi.fn().mockReturnValue({
+        name: 'test-wallet',
+        accounts: [{ chainId: 'stellar:pubnet', address: TEST_PUBLIC_KEY }],
+      }),
+      importWalletPrivateKey: vi.fn(),
+      signTransaction: vi.fn().mockReturnValue({ signature: '00'.repeat(64) }),
+    }));
+
     vi.doMock('../client', () => ({
       Stellar_CardClient: class {
         constructor() {}
@@ -183,23 +242,27 @@ describe('purchaseCardOWS resume state machine — F1-resume', () => {
         waitForCard = waitForCardSpy;
       },
     }));
-    // ows.ts imports checkSorobanTxLanded from its own module scope,
-    // so module replacement doesn't trivially swap it out. The
-    // simpler test hook: spy on the exported function and rely on the
-    // fact that purchaseCardOWS calls it via the module-local binding.
-    // For this unit test we verify the decision shape rather than
-    // the full in-module call — an integration test would exercise
-    // the real wire-up.
+
     const ows = await import('../ows');
-    vi.spyOn(ows, 'checkSorobanTxLanded').mockImplementation(checkLandedSpy);
-    vi.spyOn(ows, 'payViaContractOWS').mockImplementation(payViaContractOWSSpy);
+    const stellarSdk = await import('@stellar/stellar-sdk');
+    vi.spyOn(stellarSdk.Horizon.Server.prototype, 'loadAccount').mockResolvedValue({
+      balances: [
+        { asset_type: 'native', balance: '10' },
+        {
+          asset_type: 'credit_alphanum4',
+          asset_code: 'USDC',
+          asset_issuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
+          balance: '50',
+        },
+      ],
+    } as never);
 
     return {
       purchaseCardOWS: ows.purchaseCardOWS,
       getOrderSpy,
-      checkLandedSpy,
+      checkLandedSpy: horizonFetchSpy,
       waitForCardSpy,
-      payViaContractOWSSpy,
+      payViaContractOWSSpy: submitSorobanTxSpy,
     };
   }
 
@@ -213,20 +276,179 @@ describe('purchaseCardOWS resume state machine — F1-resume', () => {
   // End-to-end coverage of the payViaContractOWS call path is done
   // via the integration tests that hit the real stellar-sdk.
 
-  it('calls checkSorobanTxLanded when resume carries a priorTxHash', async () => {
-    const { getOrderSpy, checkLandedSpy } = await loadPurchaseCardOWSWithMocks({
-      orderStatus: {
-        phase: 'ready',
-        card: { number: '4111', cvv: '123', expiry: '12/30', brand: 'Visa' },
-      },
-      landedResult: 'landed',
+  const BASE_RESUME_OPTS = {
+    apiKey: 'test-key',
+    walletName: 'test-wallet',
+    amountUsdc: '10.00',
+  };
+
+  it('short-circuits to the card when the order is already ready (no landed-check, no resubmit)', async () => {
+    const { purchaseCardOWS, getOrderSpy, checkLandedSpy, payViaContractOWSSpy } =
+      await loadPurchaseCardOWSWithMocks({
+        orderStatus: {
+          phase: 'ready',
+          card: { number: '4111', cvv: '123', expiry: '12/30', brand: 'Visa' },
+        },
+        landedResult: 'landed',
+      });
+
+    const result = await purchaseCardOWS({
+      ...BASE_RESUME_OPTS,
+      resume: { orderId: 'ord_ready', txHash: 'deadbeef'.repeat(8), phase: 'unpaid' },
     });
-    // When phase is 'ready' the resume short-circuits before the
-    // landed-check, so this particular setup doesn't invoke
-    // checkSorobanTxLanded. We test the short-circuit here and the
-    // landed-check invocation in the next test.
-    expect(getOrderSpy).not.toHaveBeenCalled();
+
+    expect(result.order_id).toBe('ord_ready');
+    expect(result.number).toBe('4111');
+    expect(getOrderSpy).toHaveBeenCalledTimes(1);
+    expect(getOrderSpy).toHaveBeenCalledWith('ord_ready');
+    // Phase is 'ready' — the landed-check and a resubmit would risk a
+    // double payment on an order that's already settled. Neither must run.
     expect(checkLandedSpy).not.toHaveBeenCalled();
+    expect(payViaContractOWSSpy).not.toHaveBeenCalled();
+  });
+
+  it('skips payment (waits) when the prior tx has landed — prevents double payment', async () => {
+    const { purchaseCardOWS, checkLandedSpy, payViaContractOWSSpy, waitForCardSpy } =
+      await loadPurchaseCardOWSWithMocks({
+        orderStatus: { phase: 'awaiting_payment' },
+        landedResult: 'landed',
+      });
+
+    const result = await purchaseCardOWS({
+      ...BASE_RESUME_OPTS,
+      resume: { orderId: 'ord_landed', txHash: 'cafebabe'.repeat(8), phase: 'unpaid' },
+    });
+
+    expect(checkLandedSpy).toHaveBeenCalledTimes(1);
+    expect(checkLandedSpy.mock.calls[0][0]).toContain('cafebabe'.repeat(8));
+    // Tx already landed on-chain — resubmitting would double-pay. Must not resubmit.
+    expect(payViaContractOWSSpy).not.toHaveBeenCalled();
+    expect(waitForCardSpy).toHaveBeenCalledTimes(1);
+    expect(result.number).toBe('4111');
+  });
+
+  it('skips payment (waits) when the landed-check is inconclusive — conservative, no double payment', async () => {
+    const { purchaseCardOWS, checkLandedSpy, payViaContractOWSSpy, waitForCardSpy } =
+      await loadPurchaseCardOWSWithMocks({
+        orderStatus: { phase: 'awaiting_payment' },
+        landedResult: 'pending',
+      });
+
+    await purchaseCardOWS({
+      ...BASE_RESUME_OPTS,
+      resume: { orderId: 'ord_pending', txHash: 'f00dface'.repeat(8), phase: 'unpaid' },
+    });
+
+    expect(checkLandedSpy).toHaveBeenCalledTimes(1);
+    // Can't tell if it's in-flight or dropped — resubmitting risks a
+    // double-pay if it eventually lands, so the state machine must wait.
+    expect(payViaContractOWSSpy).not.toHaveBeenCalled();
+    expect(waitForCardSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('rebuilds and resubmits when the prior tx dropped and the order still has payment instructions', async () => {
+    const paymentInstructions = {
+      contract_id: 'CADQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQOBYHA4DQP5KR',
+      usdc: { amount: '10.00', asset: 'USDC:GA5Z...' },
+    };
+    const { purchaseCardOWS, checkLandedSpy, payViaContractOWSSpy, waitForCardSpy } =
+      await loadPurchaseCardOWSWithMocks({
+        orderStatus: { phase: 'awaiting_payment', payment: paymentInstructions },
+        landedResult: 'dropped',
+      });
+
+    const result = await purchaseCardOWS({
+      ...BASE_RESUME_OPTS,
+      paymentAsset: 'usdc',
+      resume: { orderId: 'ord_dropped', txHash: 'deadc0de'.repeat(8), phase: 'unpaid' },
+    });
+
+    expect(checkLandedSpy).toHaveBeenCalledTimes(1);
+    // Dropped pre-apply — safe (and necessary) to rebuild from the
+    // order's persisted payment instructions and resubmit exactly once.
+    expect(payViaContractOWSSpy).toHaveBeenCalledTimes(1);
+    expect(waitForCardSpy).toHaveBeenCalledTimes(1);
+    expect(result.number).toBe('4111');
+  });
+
+  it('throws OrderFailedError (does not resubmit) when the order expired during the outage', async () => {
+    const { purchaseCardOWS, payViaContractOWSSpy, checkLandedSpy } =
+      await loadPurchaseCardOWSWithMocks({
+        orderStatus: { phase: 'expired' },
+        landedResult: 'dropped',
+      });
+
+    await expect(
+      purchaseCardOWS({
+        ...BASE_RESUME_OPTS,
+        resume: { orderId: 'ord_expired', txHash: 'abad1dea'.repeat(8), phase: 'unpaid' },
+      }),
+    ).rejects.toThrow(/Order ord_expired failed/);
+
+    // Expired is terminal — never consult the landed-check or resubmit
+    // against an order the backend has already closed out.
+    expect(checkLandedSpy).not.toHaveBeenCalled();
+    expect(payViaContractOWSSpy).not.toHaveBeenCalled();
+  });
+
+  it('throws OrderFailedError for failed/refunded/rejected orders too, each without resubmitting', async () => {
+    for (const phase of ['failed', 'refunded', 'rejected'] as const) {
+      const { purchaseCardOWS, payViaContractOWSSpy } = await loadPurchaseCardOWSWithMocks({
+        orderStatus: { phase },
+        landedResult: 'dropped',
+      });
+      await expect(
+        purchaseCardOWS({ ...BASE_RESUME_OPTS, resume: `ord_${phase}` }),
+      ).rejects.toThrow(/Order ord_\w+ failed/);
+      expect(payViaContractOWSSpy).not.toHaveBeenCalled();
+    }
+  });
+
+  it('includes the refund txid in the error message when the order response carries one', async () => {
+    const { purchaseCardOWS } = await loadPurchaseCardOWSWithMocks({
+      orderStatus: {
+        phase: 'refunded',
+        refund: { stellar_txid: 'refund-tx-hash-123' },
+      } as unknown as { phase: string },
+      landedResult: 'dropped',
+    });
+
+    await expect(
+      purchaseCardOWS({ ...BASE_RESUME_OPTS, resume: 'ord_expired_refunded' }),
+    ).rejects.toThrow(/refund-tx-hash-123/);
+  });
+
+  it('waits conservatively on a bare-string resume with no prior tx context (no resubmit)', async () => {
+    const { purchaseCardOWS, checkLandedSpy, payViaContractOWSSpy, waitForCardSpy } =
+      await loadPurchaseCardOWSWithMocks({
+        orderStatus: { phase: 'awaiting_payment' },
+        landedResult: 'landed',
+      });
+
+    await purchaseCardOWS({ ...BASE_RESUME_OPTS, resume: 'ord_bare_string' });
+
+    // No txHash was supplied (bare-string resume) — the landed-check has
+    // nothing to check against, so it must not run, and we must wait
+    // rather than risk resubmitting an unknown payment.
+    expect(checkLandedSpy).not.toHaveBeenCalled();
+    expect(payViaContractOWSSpy).not.toHaveBeenCalled();
+    expect(waitForCardSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('waits when the backend reports an in-progress phase other than awaiting_payment', async () => {
+    const { purchaseCardOWS, payViaContractOWSSpy, waitForCardSpy } =
+      await loadPurchaseCardOWSWithMocks({
+        orderStatus: { phase: 'processing' },
+        landedResult: 'landed',
+      });
+
+    await purchaseCardOWS({
+      ...BASE_RESUME_OPTS,
+      resume: { orderId: 'ord_processing', txHash: 'beefbeef'.repeat(8), phase: 'unpaid' },
+    });
+
+    expect(payViaContractOWSSpy).not.toHaveBeenCalled();
+    expect(waitForCardSpy).toHaveBeenCalledTimes(1);
   });
 
   it('loadLastOrder reads the fields the resume path relies on', () => {

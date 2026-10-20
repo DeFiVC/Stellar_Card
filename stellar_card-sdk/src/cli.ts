@@ -58,6 +58,8 @@ Usage:
                                      Cryptographically verify an on-chain payment proof
   stellar_card doctor [--contract <C…>]
                                      Check local runtime, backend, Stellar endpoints, and contract
+  stellar_card qr <order-id>             Print a scannable QR code for an order's payment
+                                     (--svg, --png, or --json for other formats)
   stellar_card logout                    Clear cached session tokens and api keys
   stellar_card cache clear               Clear local cached state (same as logout)
   stellar_card mcp                       Start the MCP server over stdio (default)
@@ -129,6 +131,11 @@ Onboarding guide for agents: https://stellar_card.com/skill.md
   if (cmd === 'profile') {
     const { profileCommand } = await import('./commands/profile');
     return profileCommand(rest);
+  }
+
+  if (cmd === 'qr') {
+    const { qrCommand } = await import('./commands/qr');
+    return qrCommand(rest);
   }
 
   if (cmd === 'logout' || cmd === 'cache-clear' || cmd === 'cache') {
