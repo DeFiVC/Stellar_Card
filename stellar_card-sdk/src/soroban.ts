@@ -884,6 +884,47 @@ export async function submitSorobanTx(
 }
 
 /**
+ * Automatically simulate a Soroban contract invocation to estimate gas costs and
+ * populate resource fees and authorization entries before submission.
+ *
+ * This helper wraps the simulation logic from buildContractPaymentTx so callers
+ * can estimate gas costs for a transaction without building the full payment flow.
+ * Useful for calculating fees, validating contracts, or dry-running contract calls.
+ *
+ * @param tx - The unsigned Soroban transaction to simulate
+ * @param server - Soroban RPC server instance
+ * @returns The simulation result with populated resource fees and auth entries
+ * @throws {Error} If Soroban simulation fails (e.g. contract revert)
+ *
+ * @example
+ * ```typescript
+ * const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase })
+ *   .addOperation(contract.call(...))
+ *   .setTimeout(180)
+ *   .build();
+ *
+ * const sim = await simulateContractTransaction(tx, server);
+ * const prepared = rpc.assembleTransaction(tx, sim).build();
+ * prepared.sign(keypair);
+ * const result = await submitSorobanTx(prepared, server, horizonUrl);
+ * ```
+ */
+export async function simulateContractTransaction(
+  tx: Transaction,
+  server: rpc.Server,
+): Promise<rpc.Api.SimulateTransactionResponse> {
+  const sim = await server.simulateTransaction(tx);
+  if (rpc.Api.isSimulationError(sim)) {
+    const contractCode = extractContractErrorCode(sim);
+    if (contractCode !== null) {
+      throw parseContractError(sim);
+    }
+    throw new Error(`Soroban simulation failed: ${sim.error}`);
+  }
+  return sim;
+}
+
+/**
  * Decide which contract function + asset amount to use based on the
  * PaymentInstructions returned from POST /v1/orders.
  *
