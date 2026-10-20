@@ -294,6 +294,13 @@ export type {
   OrderEventSubscription,
   OrderHistoryEntry,
   OrderHistoryResponse,
+  // Order status discriminated union (#729)
+  OrderCard,
+  OrderStatusLiteral,
+  ActiveOrder,
+  PendingOrder,
+  FailedOrder,
+  Order,
 } from './types';
 
 export {
@@ -309,4 +316,8 @@ export {
   isOrderEvent,
   isWebhookDelivery,
   isOrderEventSubscription,
+  // Order status type guards (#729)
+  isActiveOrder,
+  isPendingOrder,
+  isFailedOrder,
 } from './types';
