@@ -119,7 +119,11 @@ export function importStellarKey(
   vaultPath?: string,
 ): { walletId: string; publicKey: string } {
   const keypair = Keypair.fromSecret(stellarSecret);
-  const ed25519KeyHex = Buffer.from(keypair.rawSecretKey()).toString('hex');
+  const secretBuffer = Buffer.from(keypair.rawSecretKey());
+  const ed25519KeyHex = secretBuffer.toString('hex');
+  // Wipe the raw secret key material from memory now that it has been
+  // copied into the hex form handed to OWS vault storage.
+  zeroizeSecret(secretBuffer);
   const wallet = importWalletPrivateKey(
     name,
     '', // secp256k1 key (EVM) — not used for Stellar
@@ -130,6 +134,29 @@ export function importStellarKey(
     ed25519KeyHex,
   );
   return { walletId: wallet.id, publicKey: getStellarAddress(wallet) };
+}
+
+// ── Secure in-memory zeroization of secret keys ───────────────────────────
+
+/**
+ * Securely zero out secret key material held in a `Uint8Array`/`Buffer` in
+ * place.
+ *
+ * Fills every byte with `0` so the plaintext secret no longer resides in
+ * memory after it has been copied into a derived form (e.g. the hex form
+ * handed to OWS vault storage). JavaScript `string`s are immutable and
+ * cannot be overwritten in place — pass secrets as `Buffer`/`Uint8Array`
+ * when you need true in-memory zeroization, and reassign any `string`
+ * copies to `''` once they are no longer needed.
+ *
+ * @param buf - Buffer holding secret key material to be destroyed.
+ * @example
+ * const secret = Buffer.from(keypair.rawSecretKey());
+ * const hex = secret.toString('hex');
+ * zeroizeSecret(secret); // secret bytes wiped from memory
+ */
+export function zeroizeSecret(buf: Uint8Array): void {
+  buf.fill(0);
 }
 
 /**
