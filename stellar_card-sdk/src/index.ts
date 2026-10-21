@@ -101,6 +101,7 @@ export {
   payVCCOWS,
   saveWalletToKeystore,
   loadWalletFromKeystore,
+  zeroizeSecret,
   createKeystore,
   NodeFileSystemKeystore,
   BrowserKeystore,
