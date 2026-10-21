@@ -40,6 +40,10 @@
       "import": "./dist/esm/hardware.js",
       "require": "./dist/hardware.js"
     },
+    "./mock": {
+      "types": "./dist/mock.d.ts",
+      "import": "./dist/esm/mock.js",
+      "require": "./dist/mock.js"
     "./react": {
       "types": "./dist/integrations/react.d.ts",
       "import": "./dist/esm/integrations/react.js",
@@ -127,6 +131,8 @@
       "hardware": [
         "./dist/hardware.d.ts"
       ],
+      "mock": [
+        "./dist/mock.d.ts"
       "react": [
         "./dist/integrations/react.d.ts"
       ]

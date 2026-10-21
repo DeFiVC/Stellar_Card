@@ -66,6 +66,7 @@ Usage:
   stellar_card cache clear               Clear local cached state (same as logout)
   stellar_card mcp                       Start the MCP server over stdio (default)
   stellar_card version                   Print the SDK version
+  stellar_card completion bash|zsh|fish  Print a shell completion script
   stellar_card --help                    Show this message
 
 All the 'purchase' and 'wallet' subcommands read ~/.stellar_card/config.json
@@ -161,6 +162,11 @@ Onboarding guide for agents: https://stellar_card.com/skill.md
     const { startMcpServer } = await import('./mcp');
     await startMcpServer();
     return 0;
+  }
+
+  if (cmd === 'completion') {
+    const { completionCommand } = await import('./cli-completion');
+    return completionCommand(rest);
   }
 
   process.stderr.write(`error: unknown command '${cmd}'\n`);
