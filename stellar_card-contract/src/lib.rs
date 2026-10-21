@@ -104,8 +104,10 @@
 //! | `WithdrawLimitPerCall` | instance   | only while a per-call limit is set             |
 //! | `WithdrawLimitPerDay`  | instance   | only while a daily limit is set                |
 //! | `DailyWithdrawn`       | instance   | after the first `rescue_tokens`; one slot, reused every day |
+//! | `PaymentRateLimitConfig`| instance   | only when the admin overrides the default payment rate |
 //! | `UserRole(address)`    | persistent | while `address` holds a role                   |
 //! | `Blacklist(address)`   | persistent | only while `address` is blacklisted (absent means allowed) |
+//! | `PaymentRateLimit(address)` | temporary | recent payment ledgers within the configured window |
 //! | `ReentrancyGuard`      | temporary  | only during a guarded external call            |
 
 #![no_std]
@@ -128,6 +130,9 @@ const INSTANCE_TTL_MAX: u32 = 17_280_000;
 /// extension only fires roughly once every ~500 days' worth of calls
 /// instead of on (almost) every single one.
 const INSTANCE_TTL_THRESHOLD: u32 = INSTANCE_TTL_MAX / 2;
+const DEFAULT_PAYMENT_LIMIT: u32 = 10;
+const DEFAULT_PAYMENT_WINDOW: u32 = 100;
+const MAX_PAYMENT_LIMIT: u32 = 1_000;
 
 /// Decimal precision `init` requires of both token contracts (Issue #399 -
 /// Part 2). Every Stellar Asset Contract — including the USDC and native XLM
@@ -194,6 +199,10 @@ pub enum DataKey {
     /// Maximum cumulative amount `rescue_tokens` may move across all calls
     /// within a single day. Key absent means no daily cap.
     WithdrawLimitPerDay,
+    /// Per-payer payment counter for the current ledger window. Temporary storage.
+    PaymentRateLimit(Address),
+    /// Optional `(max_payments, window_ledgers)` payment-rate configuration.
+    PaymentRateLimitConfig,
     /// `(day, total)`: the running total withdrawn via `rescue_tokens` on
     /// `day` (ledger timestamp / 86400). A stored `day` older than today
     /// means nothing has been withdrawn today.
@@ -259,6 +268,10 @@ pub enum Error {
     InvalidMetadata = 8,
     /// A financial calculation exceeded the range of its integer type
     ArithmeticOverflow = 9,
+    /// Payer exceeded the configured payment rate
+    RateLimitExceeded = 10,
+    /// Payment rate parameters are zero or exceed supported bounds
+    InvalidRateLimit = 11,
 }
 
 /// The stellar_card card receiver contract.
@@ -709,6 +722,87 @@ impl Stellar_CardReceiver {
             .extend_ttl(key, INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_MAX);
     }
 
+    /// Configures the maximum payments per payer and the rolling ledger window.
+    /// The window is bounded so temporary storage can retain each payer's
+    /// counter through the full configured period.
+    pub fn set_payment_rate_limit(
+        env: Env,
+        caller: Address,
+        max_payments: u32,
+        window_ledgers: u32,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_not_decommissioned(&env);
+        if !Self::has_admin_authority(&env, &caller) {
+            panic!("set_payment_rate_limit requires the Admin role");
+        }
+        if max_payments == 0
+            || max_payments > MAX_PAYMENT_LIMIT
+            || window_ledgers == 0
+            || window_ledgers > INSTANCE_TTL_MAX / 2
+        {
+            return Err(Error::InvalidRateLimit);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentRateLimitConfig, &(max_payments, window_ledgers));
+        Self::extend_instance_ttl(&env);
+        env.events().publish(
+            (Symbol::new(&env, "payment_rate_limit_set"), caller),
+            (max_payments, window_ledgers),
+        );
+        Ok(())
+    }
+
+    /// Returns the configured `(max_payments, window_ledgers)` policy.
+    pub fn payment_rate_limit(env: Env) -> (u32, u32) {
+        env.storage()
+            .instance()
+            .get(&DataKey::PaymentRateLimitConfig)
+            .unwrap_or((DEFAULT_PAYMENT_LIMIT, DEFAULT_PAYMENT_WINDOW))
+    }
+
+    fn next_payment_rate_limit(env: &Env, payer: &Address) -> Result<Vec<u32>, Error> {
+        let (max_payments, window_ledgers) = Self::payment_rate_limit(env.clone());
+        let ledger = env.ledger().sequence();
+        let key = DataKey::PaymentRateLimit(payer.clone());
+        let previous = env
+            .storage()
+            .temporary()
+            .get::<_, Vec<u32>>(&key)
+            .unwrap_or(Vec::new(env));
+        let mut active = Vec::new(env);
+        for payment_ledger in previous.iter() {
+            if ledger
+                .checked_sub(payment_ledger)
+                .is_some_and(|elapsed| elapsed < window_ledgers)
+            {
+                active.push_back(payment_ledger);
+            }
+        }
+        if active.len() >= max_payments {
+            return Err(Error::RateLimitExceeded);
+        }
+        active.push_back(ledger);
+        Ok(active)
+    }
+
+    fn record_payment_rate_limit(
+        env: &Env,
+        payer: &Address,
+        payment_ledgers: &Vec<u32>,
+        window_ledgers: u32,
+    ) {
+        let key = DataKey::PaymentRateLimit(payer.clone());
+        env.storage().temporary().set(&key, payment_ledgers);
+        env.storage().temporary().extend_ttl(
+            &key,
+            window_ledgers,
+            window_ledgers * 2,
+        );
+    }
+
     /// Transfers USDC tokens from a payer to the contract treasury.
     ///
     /// # Arguments
@@ -758,6 +852,8 @@ impl Stellar_CardReceiver {
             return Err(Error::AddressBlacklisted);
         }
         from.require_auth();
+        let payment_ledgers = Self::next_payment_rate_limit(&env, &from)?;
+        let (_, window_ledgers) = Self::payment_rate_limit(env.clone());
 
         let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
         let usdc_contract: Address = env
@@ -779,6 +875,13 @@ impl Stellar_CardReceiver {
         if !transferred {
             return Err(Error::TransferFailed);
         }
+
+        Self::record_payment_rate_limit(
+            &env,
+            &from,
+            &payment_ledgers,
+            window_ledgers,
+        );
 
         env.events()
             .publish((symbol_short!("pay_usdc"), order_id, from), amount);
@@ -879,6 +982,8 @@ impl Stellar_CardReceiver {
             return Err(Error::AddressBlacklisted);
         }
         from.require_auth();
+        let payment_ledgers = Self::next_payment_rate_limit(&env, &from)?;
+        let (_, window_ledgers) = Self::payment_rate_limit(env.clone());
 
         let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
         let xlm_contract: Address = env.storage().instance().get(&DataKey::XlmContract).unwrap();
@@ -896,6 +1001,13 @@ impl Stellar_CardReceiver {
         if !transferred {
             return Err(Error::TransferFailed);
         }
+
+        Self::record_payment_rate_limit(
+            &env,
+            &from,
+            &payment_ledgers,
+            window_ledgers,
+        );
 
         env.events()
             .publish((symbol_short!("pay_xlm"), order_id, from), amount);
@@ -2511,6 +2623,69 @@ mod test {
 
         assert_eq!(f.usdc_balance(&f.treasury), amount);
         assert_eq!(f.usdc_balance(&f.payer), 0);
+    }
+
+    #[test]
+    fn test_payment_rate_limit_is_configurable_and_defaults_to_ten_per_hundred_ledgers() {
+        let f = Fixture::new();
+        f.init();
+        assert_eq!(f.client().payment_rate_limit(), (10, 100));
+
+        f.client()
+            .set_payment_rate_limit(&f.admin, &3, &25)
+            .unwrap();
+        assert_eq!(f.client().payment_rate_limit(), (3, 25));
+        assert_eq!(
+            f.client().try_set_payment_rate_limit(&f.admin, &0, &25),
+            Err(Ok(Error::InvalidRateLimit))
+        );
+    }
+
+    #[test]
+    fn test_payment_rate_limit_is_shared_across_assets_and_resets_after_window() {
+        let f = Fixture::new();
+        f.init();
+        f.client()
+            .set_payment_rate_limit(&f.admin, &2, &3)
+            .unwrap();
+        f.mint_usdc(&f.payer, 2);
+        f.mint_xlm(&f.payer, 1);
+
+        f.client()
+            .pay_usdc(&f.payer, &1, &order_bytes(&f.env, "rate-usdc-1"));
+        f.client()
+            .pay_xlm(&f.payer, &1, &order_bytes(&f.env, "rate-xlm-1"));
+        assert_eq!(
+            f.client()
+                .try_pay_usdc(&f.payer, &1, &order_bytes(&f.env, "rate-blocked")),
+            Err(Ok(Error::RateLimitExceeded))
+        );
+
+        f.env.ledger().with_mut(|ledger| {
+            ledger.sequence_number += 3;
+        });
+        f.client()
+            .pay_usdc(&f.payer, &1, &order_bytes(&f.env, "rate-reset"));
+        assert_eq!(f.usdc_balance(&f.treasury), 2);
+        assert_eq!(f.xlm_balance(&f.treasury), 1);
+    }
+
+    #[test]
+    fn test_failed_payment_does_not_consume_rate_limit_slot() {
+        let f = Fixture::new();
+        f.init();
+        f.client()
+            .set_payment_rate_limit(&f.admin, &1, &10)
+            .unwrap();
+        let order_id = order_bytes(&f.env, "failed-rate-payment");
+        assert_eq!(
+            f.client().try_pay_usdc(&f.payer, &1, &order_id),
+            Err(Ok(Error::TransferFailed))
+        );
+
+        f.mint_usdc(&f.payer, 1);
+        f.client().pay_usdc(&f.payer, &1, &order_id);
+        assert_eq!(f.usdc_balance(&f.treasury), 1);
     }
 
     #[test]
@@ -7086,6 +7261,8 @@ mod test {
         assert_eq!(Error::InvalidDiscount as u32, 7);
         assert_eq!(Error::InvalidMetadata as u32, 8);
     assert_eq!(Error::ArithmeticOverflow as u32, 9);
+    assert_eq!(Error::RateLimitExceeded as u32, 10);
+    assert_eq!(Error::InvalidRateLimit as u32, 11);
     }
 
     /// The crate docs state `TOKEN_DECIMALS` is 7 and that the TTL threshold
