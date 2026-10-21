@@ -103,6 +103,7 @@
 //! | `WithdrawLimitPerDay`  | instance   | only while a daily limit is set                |
 //! | `DailyWithdrawn`       | instance   | after the first `rescue_tokens`; one slot, reused every day |
 //! | `UserRole(address)`    | persistent | while `address` holds a role                   |
+//! | `Blacklist(address)`   | persistent | only while `address` is blacklisted (absent means allowed) |
 //! | `ReentrancyGuard`      | temporary  | only during a guarded external call            |
 
 #![no_std]
@@ -202,6 +203,15 @@ pub enum DataKey {
     /// full by every call, so that growth taxed every payment forever. This
     /// single slot is overwritten in place, keeping the footprint constant.
     DailyWithdrawn,
+    /// Marks `address` as sanctions-flagged: `pay_usdc`/`pay_xlm` refuse it as
+    /// the payer. Only stored while blacklisted — an absent key means allowed.
+    ///
+    /// # Storage
+    /// A per-address persistent key rather than one `Map<Address, bool>`, for
+    /// the same reason as `UserRole`: each change touches only its own entry,
+    /// and the payment path reads one entry instead of deserializing a map
+    /// that grows with the list.
+    Blacklist(Address),
 }
 
 /// Errors returned by the fallible (`Result`-returning) entrypoints.
@@ -228,6 +238,8 @@ pub enum Error {
     /// `rescue_tokens` recipient is the contract itself, which would move
     /// nothing while still spending the day's withdraw budget
     InvalidRecipient = 6,
+    /// The payer address is blacklisted and may not fund cards
+    AddressBlacklisted = 7,
 }
 
 /// The stellar_card card receiver contract.
@@ -523,6 +535,62 @@ impl Stellar_CardReceiver {
             .unwrap_or(false)
     }
 
+    /// Returns `true` if `account` is currently blacklisted.
+    fn is_blacklisted(env: &Env, account: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::Blacklist(account.clone()))
+    }
+
+    /// Adds or removes `account` from the payer blacklist.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `caller` - The compliance operator or admin (must authorize this call)
+    /// * `account` - The address to flag or clear
+    /// * `status` - `true` to blacklist, `false` to remove from the blacklist
+    ///
+    /// # Authorization
+    /// Requires `caller` to hold at least the `Operator` role (the stored
+    /// admin always qualifies), like `pause`: flagging a sanctioned address
+    /// is an operational response and should not wait for the admin.
+    ///
+    /// # Events
+    /// Emits: topics=[Symbol("address_blacklisted"), account], value=caller
+    /// when an address is newly blacklisted, or
+    /// topics=[Symbol("address_unblacklisted"), account], value=caller when
+    /// one is cleared. Re-applying the current status is a no-op with no event.
+    ///
+    /// # Panics
+    /// Panics if called before `init`, if `caller.require_auth()` fails, or if
+    /// `caller` does not hold at least the `Operator` role.
+    pub fn set_blacklisted(env: Env, caller: Address, account: Address, status: bool) {
+        caller.require_auth();
+        if !Self::has_authority(&env, &caller, Role::Operator) {
+            panic!("set_blacklisted requires at least the Operator role");
+        }
+        let key = DataKey::Blacklist(account.clone());
+        let currently = env.storage().persistent().has(&key);
+        if currently == status {
+            return;
+        }
+        if status {
+            env.storage().persistent().set(&key, &true);
+            Self::extend_role_ttl(&env, &key);
+            env.events()
+                .publish((Symbol::new(&env, "address_blacklisted"), account), caller);
+        } else {
+            env.storage().persistent().remove(&key);
+            env.events()
+                .publish((Symbol::new(&env, "address_unblacklisted"), account), caller);
+        }
+    }
+
+    /// Returns `true` if `account` is blacklisted and therefore cannot pay.
+    pub fn is_blacklisted_view(env: Env, account: Address) -> bool {
+        Self::is_blacklisted(&env, &account)
+    }
+
     /// Pauses the contract, blocking all token transfers.
     ///
     /// # Arguments
@@ -646,6 +714,7 @@ impl Stellar_CardReceiver {
     /// * `InvalidAmount` - If amount is <= 0
     /// * `TransferFailed` - If the underlying token transfer fails
     /// * `ContractPaused` - If the contract is currently paused
+    /// * `AddressBlacklisted` - If `from` is on the payer blacklist
     ///
     /// # Authorization
     /// Requires `from.require_auth()`. The check runs after the pause and
@@ -664,6 +733,9 @@ impl Stellar_CardReceiver {
         }
         if amount <= 0 {
             return Err(Error::InvalidAmount);
+        }
+        if Self::is_blacklisted(&env, &from) {
+            return Err(Error::AddressBlacklisted);
         }
         from.require_auth();
 
@@ -707,6 +779,7 @@ impl Stellar_CardReceiver {
     /// * `InvalidAmount` - If amount is <= 0
     /// * `TransferFailed` - If the underlying token transfer fails
     /// * `ContractPaused` - If the contract is currently paused
+    /// * `AddressBlacklisted` - If `from` is on the payer blacklist
     ///
     /// # Authorization
     /// Requires `from.require_auth()`, checked after the pause and amount
@@ -725,6 +798,9 @@ impl Stellar_CardReceiver {
         }
         if amount <= 0 {
             return Err(Error::InvalidAmount);
+        }
+        if Self::is_blacklisted(&env, &from) {
+            return Err(Error::AddressBlacklisted);
         }
         from.require_auth();
 
