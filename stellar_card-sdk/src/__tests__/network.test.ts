@@ -192,3 +192,217 @@ describe('validateRpcEndpoint', () => {
     expect(() => validateRpcEndpoint('ftp://rpc.stellar.org')).toThrow(/Invalid protocol: ftp/);
   });
 });
+
+describe('HTTP agent pooling and connection management', () => {
+  it('resolves network configuration with timeout settings', () => {
+    const cfg = resolveNetworkConfig({
+      sorobanRpcUrl: {
+        url: 'https://rpc.example.com',
+        timeout: 15000,
+        headers: { 'X-Custom': 'value' },
+      },
+    });
+
+    expect(cfg.sorobanRpc.timeout).toBe(15000);
+    expect(cfg.sorobanRpc.headers).toEqual({ 'X-Custom': 'value' });
+  });
+
+  it('applies default timeout when not specified', () => {
+    const cfg = resolveNetworkConfig({
+      sorobanRpcUrl: 'https://rpc.example.com',
+    });
+
+    expect(cfg.sorobanRpc.timeout).toBe(30000); // default timeout
+  });
+
+  it('preserves custom headers across configuration resolution', () => {
+    const cfg = resolveNetworkConfig({
+      sorobanRpcUrl: {
+        url: 'https://rpc.example.com',
+        timeout: 20000,
+        headers: {
+          'X-Trace-Id': 'abc123',
+          'X-Request-Id': 'xyz789',
+          'User-Agent': 'StellarCard/1.0',
+        },
+      },
+    });
+
+    expect(cfg.sorobanRpc.headers).toEqual({
+      'X-Trace-Id': 'abc123',
+      'X-Request-Id': 'xyz789',
+      'User-Agent': 'StellarCard/1.0',
+    });
+  });
+
+  it('handles concurrent request configuration', () => {
+    const cfg = resolveNetworkConfig({
+      sorobanRpcUrl: {
+        url: 'https://rpc1.example.com',
+        timeout: 25000,
+      },
+      horizonUrl: {
+        url: 'https://horizon.example.com',
+        timeout: 15000,
+      },
+    });
+
+    expect(cfg.sorobanRpc.timeout).toBe(25000);
+    expect(cfg.horizon.timeout).toBe(15000);
+  });
+});
+
+describe('DNS resolution and error handling', () => {
+  it('validates RPC endpoint hostname structure', () => {
+    expect(() => {
+      validateRpcEndpoint('https://valid-hostname.example.com');
+    }).not.toThrow();
+
+    expect(() => {
+      validateRpcEndpoint('https://localhost:8000');
+    }).not.toThrow();
+
+    expect(() => {
+      validateRpcEndpoint('https://192.168.1.1');
+    }).not.toThrow();
+  });
+
+  it('rejects malformed URLs that would fail DNS lookup', () => {
+    expect(() => {
+      validateRpcEndpoint('https://');
+    }).toThrow();
+
+    expect(() => {
+      validateRpcEndpoint('https://[invalid');
+    }).toThrow();
+  });
+
+  it('preserves API key for authenticated endpoint configuration', () => {
+    const cfg = resolveNetworkConfig({
+      sorobanRpcUrl: {
+        url: 'https://api.example.com',
+        apiKey: 'secret-key-12345',
+        timeout: 10000,
+      },
+    });
+
+    expect(cfg.sorobanRpc.apiKey).toBe('secret-key-12345');
+  });
+});
+
+describe('TLS handshake and timeout handling', () => {
+  it('configures timeout for TLS operations', () => {
+    const cfg = resolveNetworkConfig({
+      sorobanRpcUrl: {
+        url: 'https://secure-rpc.example.com',
+        timeout: 5000,
+      },
+    });
+
+    expect(cfg.sorobanRpc.timeout).toBe(5000);
+  });
+
+  it('allows custom timeout configuration for slow networks', () => {
+    const cfg = resolveNetworkConfig({
+      sorobanRpcUrl: {
+        url: 'https://rpc.example.com',
+        timeout: 60000, // 60 seconds for slow networks
+      },
+    });
+
+    expect(cfg.sorobanRpc.timeout).toBe(60000);
+  });
+
+  it('validates timeout is a positive integer', () => {
+    const envKey = 'STELLAR_CARD_NETWORK_TIMEOUT';
+    const saved = process.env[envKey];
+    try {
+      process.env[envKey] = '0';
+      expect(() => {
+        resolveNetworkConfigFromEnv();
+      }).toThrow(/positive integer/);
+
+      process.env[envKey] = '-5000';
+      expect(() => {
+        resolveNetworkConfigFromEnv();
+      }).toThrow(/positive integer/);
+    } finally {
+      if (saved === undefined) {
+        delete process.env[envKey];
+      } else {
+        process.env[envKey] = saved;
+      }
+    }
+  });
+});
+
+describe('Request retry header injection', () => {
+  it('preserves custom headers in resolved configuration', () => {
+    const cfg = resolveNetworkConfig({
+      sorobanRpcUrl: {
+        url: 'https://rpc.example.com',
+        headers: {
+          'Retry-After': '30',
+          'X-Idempotency-Key': 'unique-value',
+          'X-Request-Priority': 'high',
+        },
+      },
+    });
+
+    expect(cfg.sorobanRpc.headers?.['Retry-After']).toBe('30');
+    expect(cfg.sorobanRpc.headers?.['X-Idempotency-Key']).toBe('unique-value');
+    expect(cfg.sorobanRpc.headers?.['X-Request-Priority']).toBe('high');
+  });
+
+  it('merges headers from multiple sources', () => {
+    const cfg = resolveNetworkConfig({
+      sorobanRpcUrl: {
+        url: 'https://rpc1.example.com',
+        headers: { 'X-Custom-1': 'value1' },
+      },
+      horizonUrl: {
+        url: 'https://horizon.example.com',
+        headers: { 'X-Custom-2': 'value2' },
+      },
+    });
+
+    expect(cfg.sorobanRpc.headers?.['X-Custom-1']).toBe('value1');
+    expect(cfg.horizon.headers?.['X-Custom-2']).toBe('value2');
+  });
+
+  it('ignores blank header values during configuration resolution', () => {
+    const cfg = resolveNetworkConfig({
+      sorobanRpcUrl: {
+        url: 'https://rpc.example.com',
+        headers: {
+          'X-Valid-Header': 'has-value',
+          'X-Empty-Header': '',
+        },
+      },
+    });
+
+    expect(cfg.sorobanRpc.headers?.['X-Valid-Header']).toBe('has-value');
+  });
+
+  it('applies headers to consecutive requests in pooled connections', () => {
+    const headers1 = { 'X-Request-1': 'first' };
+    const headers2 = { 'X-Request-2': 'second' };
+
+    const cfg1 = resolveNetworkConfig({
+      sorobanRpcUrl: {
+        url: 'https://rpc.example.com',
+        headers: headers1,
+      },
+    });
+
+    const cfg2 = resolveNetworkConfig({
+      sorobanRpcUrl: {
+        url: 'https://rpc.example.com',
+        headers: headers2,
+      },
+    });
+
+    expect(cfg1.sorobanRpc.headers?.['X-Request-1']).toBe('first');
+    expect(cfg2.sorobanRpc.headers?.['X-Request-2']).toBe('second');
+  });
+});

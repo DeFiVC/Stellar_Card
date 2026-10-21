@@ -4,6 +4,26 @@ Virtual Visa cards for AI agents — pay with USDC or XLM on Stellar, get a card
 
 [stellar_card.com](https://stellar_card.com) issues prepaid Visa virtual cards on demand. This SDK lets AI agents create an order, pay the stellar_card Soroban receiver contract on Stellar, and receive card details programmatically — all in one call.
 
+## Contents
+
+- [Install](#install)
+- [Quickstart: Node.js](#quickstart-nodejs)
+- [Quickstart: React / Next.js](#quickstart-react--nextjs)
+- [Quickstart: CLI](#quickstart-cli)
+- [Funding your wallet](#funding-your-wallet)
+- [Step-by-step API (for more control)](#step-by-step-api-for-more-control)
+- [Constructor options](#constructor-options)
+- [API reference](#api-reference)
+- [Code recipes](#code-recipes)
+- [Pagination helpers](#pagination-helpers)
+- [Custom RPC endpoints](#custom-rpc-endpoints)
+- [Retry tuning](#retry-tuning)
+- [MCP server](#mcp-server--for-claude-desktop-cursor-and-other-mcp-clients)
+- [Error handling](#error-handling)
+- [Troubleshooting](#troubleshooting)
+- [Bundle size](#bundle-size)
+- [Keeping card details safe](#keeping-card-details-safe)
+
 ## Install
 
 ```bash
@@ -28,7 +48,7 @@ Fix in your own `package.json`:
 
 then `rm -rf node_modules package-lock.json && npm install`. `npm audit` returns clean. Upstream fix tracked at [stellar/js-stellar-sdk#1381](https://github.com/stellar/js-stellar-sdk/pull/1381); this note will be removed as soon as it merges and a new stellar-sdk ships.
 
-## Quick start
+## Quickstart: Node.js
 
 ```typescript
 import { createOWSWallet, getOWSBalance, purchaseCardOWS } from 'stellar_card';
@@ -59,7 +79,111 @@ console.log(card.number, card.cvv, card.expiry);
 3. Subscribe to the SSE stream at `/v1/orders/:id/stream`
 4. Return the card details as soon as the `ready` event arrives
 
-No polling loops, no webhook endpoint required.
+No polling loops, no webhook endpoint required. `createOWSWallet`, `getOWSBalance`, and
+`purchaseCardOWS` use Node's `fs`/native bindings for the encrypted wallet vault, so this
+quickstart is Node-only — browser/React apps use `stellar_card/react` (below) and bring
+their own wallet signer (a browser extension, WalletConnect, etc.).
+
+## Quickstart: React / Next.js
+
+```bash
+npm install stellar_card react
+```
+
+`stellar_card/react` is a separate subpath export so apps that don't use React never pull
+`react` into their bundle (it's an optional peer dependency — see [Bundle size](#bundle-size)).
+
+```tsx
+// app/providers.tsx — wrap your app once, near the root.
+'use client';
+import { StellarCardProvider } from 'stellar_card/react';
+
+export function Providers({ children }: { children: React.ReactNode }) {
+  return (
+    <StellarCardProvider apiKey={process.env.NEXT_PUBLIC_STELLAR_CARD_KEY!}>
+      {children}
+    </StellarCardProvider>
+  );
+}
+```
+
+```tsx
+// components/OrderStatus.tsx — track one order and pay it.
+'use client';
+import { useCardOrder } from 'stellar_card/react';
+
+export function OrderStatus({ orderId }: { orderId: string }) {
+  const { order, loading, error, pay } = useCardOrder(orderId);
+
+  if (loading) return <p>Loading…</p>;
+  if (error) return <p>Error: {error.message}</p>;
+  if (!order) return null;
+
+  return (
+    <div>
+      <p>Status: {order.status}</p>
+      {order.payment && (
+        <button
+          onClick={() =>
+            pay(async (payment) => {
+              // Submit payment.xlm / payment.usdc via your own wallet
+              // signer (browser extension, WalletConnect, server relay,
+              // etc.) and return the submitted transaction hash.
+              return submitWithConnectedWallet(payment);
+            })
+          }
+        >
+          Pay {order.payment.usdc.amount} USDC
+        </button>
+      )}
+    </div>
+  );
+}
+```
+
+```tsx
+// components/WalletBalance.tsx — show the connected wallet's balances.
+'use client';
+import { useWallet } from 'stellar_card/react';
+
+export function WalletBalance() {
+  const { publicKey, balances, connect, disconnect } = useWallet();
+
+  if (!publicKey) {
+    return <button onClick={() => connect(myWalletPublicKey)}>Connect wallet</button>;
+  }
+  return (
+    <div>
+      <p>{publicKey}</p>
+      <p>
+        {balances?.xlm ?? '0'} XLM · {balances?.usdc ?? '0'} USDC
+      </p>
+      <button onClick={disconnect}>Disconnect</button>
+    </div>
+  );
+}
+```
+
+All three hooks (`useStellarCard`, `useCardOrder`, `useWallet`) are SSR-safe: they never
+read `window` or `localStorage` during the initial render, only inside `useEffect` after
+mount, so Next.js/Remix server-rendered markup always matches the first client render —
+no hydration mismatch warnings.
+
+## Quickstart: CLI
+
+```bash
+npm install -g stellar_card
+stellar_card onboard --claim <code-from-dashboard>   # one-time setup
+stellar_card purchase --amount 10.00                 # buy a card
+stellar_card status                                  # list recent orders
+stellar_card logs --limit 20                         # recent audit events
+stellar_card logs --tail                             # follow new events live
+```
+
+`stellar_card --help` lists every subcommand. All commands read
+`~/.stellar_card/config.json` (written by `onboard`/`setup-wizard`) so you don't need to
+pass an API key on every invocation — override with `STELLAR_CARD_API_KEY` /
+`CARDS402_API_KEY` env vars when running in CI.
 
 ## Funding your wallet
 
@@ -87,6 +211,109 @@ console.log(`Pay ${order.payment.xlm.amount} XLM to contract ${order.payment.con
 // Wait for delivery (uses SSE under the hood, with polling fallback)
 const card = await client.waitForCard(order.order_id, { timeoutMs: 120000 });
 console.log(card.number, card.cvv, card.expiry);
+```
+
+## Constructor options
+
+```typescript
+new Stellar_CardClient({
+  apiKey, // string — required unless CARDS402_API_KEY env var or
+  // ~/.stellar_card/config.json resolves one.
+  baseUrl, // string — defaults to https://api.stellar_card.com/v1
+  network, // 'mainnet' | 'testnet' | 'futurenet' — defaults to 'mainnet'
+  timeout, // number (ms) — per-request timeout, defaults to 30000
+  retry: {
+    // RetryOptions — see "Retry tuning" below
+    attempts,
+    baseDelayMs,
+    maxDelayMs,
+    jitter,
+    onRetry,
+  },
+  headers, // Record<string, string> — extra headers on every request
+  logger, // Logger — plug in Pino/Winston/console; defaults to SilentLogger
+  logLevel, // 'debug' | 'info' | 'warn' | 'error' | 'silent'
+  disableVersionCheck, // boolean — skip the npm-registry version check on startup
+});
+```
+
+Credential resolution order: explicit constructor args → `CARDS402_API_KEY` /
+`CARDS402_BASE_URL` env vars → `~/.stellar_card/config.json` (written by `stellar_card
+onboard`). An `http://` (non-HTTPS) `baseUrl` is rejected unless
+`CARDS402_ALLOW_INSECURE_BASE_URL=1` is set, which is only intended for local
+integration tests.
+
+## API reference
+
+| Method                                    | Returns                         | Notes                                                                                               |
+| ----------------------------------------- | ------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `createOrder(opts)`                       | `Promise<OrderResponse>`        | Creates an order; `opts.amount_usdc` required.                                                      |
+| `getOrder(orderId)`                       | `Promise<OrderStatus>`          | Current status + payment instructions + card once delivered.                                        |
+| `listOrders(opts?)`                       | `Promise<OrderListItem[]>`      | One page; `status`/`limit`/`offset`/`since_created_at`/`since_updated_at` filters.                  |
+| `listOrdersPage(opts?)`                   | `Promise<ListOrdersPage>`       | Adds `hasMore`/`nextOffset` continuation metadata.                                                  |
+| `iterateOrders(opts?)`                    | `AsyncGenerator<OrderListItem>` | Walks every page; supports `maxItems`.                                                              |
+| `waitForCard(orderId, opts?)`             | `Promise<CardDetails>`          | SSE with polling fallback; throws `WaitTimeoutError`.                                               |
+| `waitForOrderFulfillment(orderId, opts?)` | `Promise<OrderStatus>`          | Like `waitForCard` but resolves on any terminal status, not just delivery.                          |
+| `getUsage()`                              | `Promise<UsageSummary>`         | Spend/budget summary for the API key.                                                               |
+| `getAuditLogs(opts?)`                     | `Promise<AuditLogEntry[]>`      | Recent audit events (API calls, authorizations, webhooks); `action`/`limit`/`since` filters (#731). |
+| `getAccountBalances(publicKey)`           | `Promise<AccountBalances>`      | XLM/USDC/every trustline for a Stellar G-address, via Horizon. 3s cache.                            |
+| `estimateXlmRequired(usdcAmount, opts?)`  | `Promise<XlmEstimateResult>`    | Quotes XLM needed for a USDC-denominated order via the DEX orderbook.                               |
+| `reportStatus(state, opts?)`              | `Promise<void>`                 | Best-effort onboarding telemetry; swallows its own errors.                                          |
+
+Event-style flows (SSE under the hood, no explicit `EventEmitter`):
+
+- `waitForCard({ timeoutMs, pollIntervalMs })` resolves with `CardDetails` as soon as the
+  order is delivered, or throws `WaitTimeoutError`.
+- `waitForOrderFulfillment({ timeoutMs, intervalMs, onProgress })` resolves on _any_
+  terminal status (delivered, failed, refunded, rejected, expired), and calls
+  `onProgress(status)` on every observed state transition while it polls.
+- The CLI's `stellar_card logs --tail` and the React `useCardOrder`/`useWallet` hooks poll
+  on an interval rather than subscribing to a push stream — see their respective sections
+  above for the exact polling contract.
+
+## Code recipes
+
+**Order a card paying with USDC:**
+
+```typescript
+import { Stellar_CardClient, addUsdcTrustline, payViaContract } from 'stellar_card';
+
+const client = new Stellar_CardClient({ apiKey: process.env.CARDS402_API_KEY! });
+
+const order = await client.createOrder({ amount_usdc: '10.00' });
+
+// First-time USDC payers need the trustline open (no-op if it already is).
+await addUsdcTrustline(process.env.STELLAR_SECRET_KEY!);
+
+const { hash } = await payViaContract({
+  walletSecret: process.env.STELLAR_SECRET_KEY!,
+  payment: order.payment, // the whole PaymentInstructions object from createOrder
+  paymentAsset: 'usdc',
+});
+
+const card = await client.waitForCard(order.order_id, { timeoutMs: 120_000 });
+console.log(card.number, card.cvv, card.expiry, 'paid in', hash);
+```
+
+**Order a card paying with XLM:**
+
+```typescript
+import { Stellar_CardClient, payViaContract } from 'stellar_card';
+
+const client = new Stellar_CardClient({ apiKey: process.env.CARDS402_API_KEY! });
+const order = await client.createOrder({ amount_usdc: '10.00' });
+
+// order.payment.xlm.amount is already the quoted XLM amount for this order —
+// use estimateXlmRequired() separately only if you need to show a quote to a
+// user *before* calling createOrder.
+const { hash } = await payViaContract({
+  walletSecret: process.env.STELLAR_SECRET_KEY!,
+  payment: order.payment,
+  paymentAsset: 'xlm',
+});
+
+const card = await client.waitForCard(order.order_id, { timeoutMs: 120_000 });
+console.log(card.number, card.cvv, card.expiry, 'paid in', hash);
 ```
 
 ## Pagination helpers
@@ -297,6 +524,72 @@ try {
   else if (err instanceof AuthError) { /* bad key */ }
 }
 ```
+
+## Troubleshooting
+
+**`TimeoutError: ... did not finalize within ...` (Horizon timeout)**
+The Soroban transaction submitted but Horizon didn't confirm it within the configured
+window — usually network congestion, not a failed payment. Re-check with
+`client.getOrder(orderId)`; the backend tracks the transaction independently of your
+process. Raise `timeoutMs` on `waitForCard`/`waitForOrderFulfillment` if this is routine
+on your network, and prefer `resolveNetworkConfig`/`resolveNetworkConfigFromEnv` to point
+at a lower-latency RPC/Horizon provider.
+
+**`SorobanRpcError` / "invalid XDR"**
+Usually means the payment amount, asset code, or contract ID used to build the
+transaction doesn't match what the order actually expects — always build the payment
+from the live `order.payment` object (it's authoritative and order-specific), never from
+a previous order or a hardcoded contract ID.
+
+**Wrong network (mainnet vs. testnet)**
+`new Stellar_CardClient({ network: 'testnet' })` only affects which Horizon/Soroban RPC
+the _balance and payment helpers_ talk to — it does not change `baseUrl`. If you're
+testing against a staging API, set `baseUrl` explicitly too. `detectNetworkFromPassphrase`
+and `resolveNetworkConfigFromEnv` help keep the two in sync from one source of truth (an
+env var) instead of hardcoding both.
+
+**`AuthError` immediately on construction**
+No API key was resolved from any of the three sources (constructor arg, env var,
+`~/.stellar_card/config.json`). Run `stellar_card onboard` once, or pass `apiKey`
+explicitly.
+
+**`npm audit` flags `axios`**
+See [the note under Install](#install) — it's a transitive pin inside
+`@stellar/stellar-sdk` that isn't reachable through this SDK's code paths.
+
+## Bundle size
+
+`dist/browser.js` (the entry used by `stellar_card/browser` and by bundlers resolving the
+package's `browser` field) is itself tiny — it only re-exports pure/browser-safe modules
+and contains **no bundled dependencies**: Node built-ins (`fs`, `path`, `os`, `crypto`,
+`child_process`, `worker_threads`) and Node-only modules (CLI, config loading, OWS wallet)
+are stubbed to `false` via `package.json`'s `browser` field, and `npm run check:browser`
+(`scripts/check-browser-deps.mjs`) asserts this on every PR.
+
+The dependencies that matter for a consumer's _actual_ bundle size — `@stellar/stellar-sdk`
+and `zod` — are regular `dependencies`, not bundled into `dist/browser.js`; your own
+bundler (webpack/esbuild/Vite/Next.js) resolves and tree-shakes them from `node_modules`
+the same way it would for any other npm package you import directly. `size-limit`
+(`npm run size`, wired into CI) measures `dist/browser.js` bundled as a consumer's
+bundler would, with those two externalized the same way a real app would de-dupe them if
+it already depends on `@stellar/stellar-sdk` itself:
+
+| Entry                                                              | Gzipped size | Budget |
+| ------------------------------------------------------------------ | ------------ | ------ |
+| `dist/browser.js` (`stellar_card/browser`)                         | **~20.2 KB** | 50 KB  |
+| `dist/integrations/react.js` (`stellar_card/react`, excl. `react`) | **~17.2 KB** | 20 KB  |
+
+For reference, bundling `dist/browser.js` _without_ externalizing `@stellar/stellar-sdk`
+and `zod` measures ~313 KB gzipped — almost entirely `@stellar/stellar-sdk`'s own
+pre-minified bundle (~1 MB raw) plus `zod`'s schema runtime (~165 KB raw). If your app
+doesn't already depend on `@stellar/stellar-sdk` for other Stellar interactions, expect
+that cost to land in your bundle once — it's unavoidable for a client that submits
+Soroban transactions and parses Horizon responses, and is not duplicated if you already
+import it yourself (your bundler de-dupes the same resolved module).
+
+`react` is an optional peer dependency (see `peerDependencies`/`peerDependenciesMeta` in
+`package.json`): importing from `stellar_card` or `stellar_card/browser` never pulls React
+in; only `stellar_card/react` does, and only for apps that import it.
 
 ## Keeping card details safe
 

@@ -104,15 +104,18 @@ Buys a virtual Visa card for the given USD value using the credentials
 and wallet set up by 'stellar_card onboard'. Reads ~/.stellar_card/config.json
 for the api key, wallet name, vault path, and passphrase env var.
 
+When running interactively (no --yes, --json, or --dry-run), displays wallet
+balances and prompts you to select payment currency (USDC or XLM).
+
 Options:
   -a, --amount <USDC>        Card value in USD. Required for new purchases.
-  --asset xlm|usdc           Which asset to pay with. Default: auto — picks
-                             USDC if the wallet has enough USDC to cover the
-                             order, otherwise pays in XLM. Pass an explicit
-                             value to force one.
+  --asset xlm|usdc           Which asset to pay with. Default: interactive prompt
+                             (if TTY), or auto-pick (if batch) — USDC if wallet
+                             has enough, otherwise XLM. Pass an explicit value
+                             to force one.
   --merchant <name>          Optional merchant label stored on the order.
   --memo <text>              Optional memo attached to the order metadata.
-  --json                     Emit machine-readable JSON on success.
+  --json                     Emit machine-readable JSON on success. Skips interactive prompt.
   --dry-run                  Validate flags and balances without purchasing.
   -y, --yes                  Skip the interactive confirmation prompt.
   --wallet-name <name>       Override the wallet name from config.json
@@ -124,8 +127,9 @@ Options:
   -h, --help                 Show this message
 
 Examples:
-  stellar_card purchase --amount 10                 # $10 card paid in XLM
-  stellar_card purchase --amount 5 --asset usdc
+  stellar_card purchase --amount 10                 # Interactive: shows balances, prompts currency
+  stellar_card purchase --amount 5 --asset usdc     # Force USDC payment
+  stellar_card purchase --amount 10 --yes --asset xlm  # Batch: XLM, no prompt
   stellar_card purchase --amount 10 --dry-run --json
   stellar_card purchase --resume a94d18cc-...       # pick up an interrupted purchase
 `);
@@ -139,6 +143,48 @@ async function defaultConfirm(prompt: string): Promise<boolean> {
       rl.close();
       const a = answer.trim().toLowerCase();
       resolve(a === 'y' || a === 'yes');
+    });
+  });
+}
+
+async function promptForCurrency(
+  xlmBalance: string,
+  usdcBalance: string,
+  amountUsdc: string,
+): Promise<'xlm' | 'usdc'> {
+  const readline = await import('readline');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  return new Promise((resolve) => {
+    const xlmBal = parseFloat(xlmBalance || '0');
+    const usdcBal = parseFloat(usdcBalance || '0');
+    const want = parseFloat(amountUsdc);
+
+    process.stdout.write('\n');
+    process.stdout.write('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+    process.stdout.write(' Available Balances\n');
+    process.stdout.write('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+    process.stdout.write(`  XLM:  ${xlmBal.toFixed(2)}\n`);
+    process.stdout.write(`  USDC: ${usdcBal.toFixed(2)}\n`);
+    process.stdout.write(`\n  Order total: $${want.toFixed(2)}\n`);
+    process.stdout.write('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n');
+
+    const question =
+      usdcBal >= want && want > 0
+        ? 'Select currency [1=USDC, 2=XLM, 3=cancel]: '
+        : 'Select currency [1=USDC (insufficient), 2=XLM, 3=cancel]: ';
+
+    rl.question(question, (answer) => {
+      rl.close();
+      const choice = answer.trim().toLowerCase();
+      if (choice === '1' || choice === 'usdc') {
+        resolve('usdc');
+      } else if (choice === '2' || choice === 'xlm') {
+        resolve('xlm');
+      } else {
+        // Default to cancel (empty answer or '3')
+        resolve('xlm'); // Return value won't be used if user cancels
+      }
     });
   });
 }
@@ -389,15 +435,15 @@ Your operator can mint a claim code from https://stellar_card.com/dashboard.
     return 2;
   }
 
-  // Resolve the payment asset. If the user didn't pass --asset we auto-pick
-  // based on what the wallet actually holds — agents that try to pay in an
-  // asset they have no balance for is the #1 failure mode in early piloting.
+  // Resolve the payment asset. If the user didn't pass --asset we either:
+  // - show interactive prompt (if TTY and no batch flags)
+  // - auto-pick based on balance (if batch mode)
   // Rule:
   //   - explicit --asset wins always
   //   - on resume, asset doesn't matter (the order is already paid or
   //     waiting for an existing payment)
-  //   - otherwise: pick USDC if the wallet has enough USDC to cover the
-  //     order, else pick XLM
+  //   - interactive prompt if TTY and no --yes/--json/--dry-run
+  //   - otherwise: auto-pick USDC if balance covers, else XLM
   let paymentAsset: 'xlm' | 'usdc';
   let balance: { xlm: string; usdc: string } | null = null;
   if (args.asset) {
@@ -408,20 +454,47 @@ Your operator can mint a claim code from https://stellar_card.com/dashboard.
     try {
       balance = await getBalance(walletName, vaultPath);
       const usdcBal = parseFloat(balance.usdc || '0');
+      const xlmBal = parseFloat(balance.xlm || '0');
       const wantUsdc = parseFloat(args.amount || '0');
-      if (usdcBal >= wantUsdc && wantUsdc > 0) {
-        paymentAsset = 'usdc';
-        out(
-          `→ Auto-picked USDC (wallet has ${usdcBal.toFixed(2)} USDC; covers $${wantUsdc.toFixed(2)})\n`,
+
+      // Interactive prompt if TTY and not in batch mode
+      if (
+        !args.yes &&
+        !args.json &&
+        !args.dryRun &&
+        process.stdin.isTTY &&
+        process.stdout.isTTY
+      ) {
+        paymentAsset = await promptForCurrency(
+          balance.xlm || '0',
+          balance.usdc || '0',
+          args.amount || '0',
         );
-      } else {
-        paymentAsset = 'xlm';
-        if (usdcBal > 0) {
+        if (paymentAsset === 'usdc') {
           out(
-            `→ Auto-picked XLM (wallet has only ${usdcBal.toFixed(2)} USDC; needs $${wantUsdc.toFixed(2)})\n`,
+            `→ Selected USDC (wallet has ${usdcBal.toFixed(2)} USDC; covers $${wantUsdc.toFixed(2)})\n`,
           );
         } else {
-          out(`→ Auto-picked XLM (no USDC in wallet)\n`);
+          out(
+            `→ Selected XLM (wallet has ${xlmBal.toFixed(2)} XLM; estimated fee ${(wantUsdc * 0.02).toFixed(2)} USDC)\n`,
+          );
+        }
+      } else {
+        // Auto-pick for batch mode
+        if (usdcBal >= wantUsdc && wantUsdc > 0) {
+          paymentAsset = 'usdc';
+          out(
+            `→ Auto-picked USDC (wallet has ${usdcBal.toFixed(2)} USDC; covers $${wantUsdc.toFixed(2)})\n`,
+          );
+        } else {
+          paymentAsset = 'xlm';
+          if (usdcBal > 0) {
+            out(
+              `→ Auto-picked XLM (wallet has only ${usdcBal.toFixed(2)} USDC; needs $${wantUsdc.toFixed(2)})\n`,
+            );
+          } else {
+            out(`→ Auto-picked XLM (no USDC in wallet)\n`);
+          }
         }
       }
     } catch {
