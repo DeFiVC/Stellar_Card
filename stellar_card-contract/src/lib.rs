@@ -255,6 +255,8 @@ pub enum Error {
     ContractDecommissioned = 7,
     /// Discount value exceeds the maximum allowed (10000 basis points = 100%)
     InvalidDiscount = 7,
+    /// A financial calculation exceeded the range of its integer type
+    ArithmeticOverflow = 8,
 }
 
 /// The stellar_card card receiver contract.
@@ -763,7 +765,7 @@ impl Stellar_CardReceiver {
             .unwrap();
 
         // Apply discount if the payer has one
-        let net_amount = Self::apply_discount(&env, &from, amount);
+        let net_amount = Self::apply_discount(&env, &from, amount)?;
 
         // The token contract is the only external call in this function, so
         // it is the only step that needs to run under the guard.
@@ -830,7 +832,7 @@ impl Stellar_CardReceiver {
         let xlm_contract: Address = env.storage().instance().get(&DataKey::XlmContract).unwrap();
 
         // Apply discount if the payer has one
-        let net_amount = Self::apply_discount(&env, &from, amount);
+        let net_amount = Self::apply_discount(&env, &from, amount)?;
 
         // The token contract is the only external call in this function, so
         // it is the only step that needs to run under the guard.
@@ -1134,7 +1136,11 @@ impl Stellar_CardReceiver {
 
         let day = Self::current_day(&env);
         let withdrawn_today = Self::withdrawn_on(&env, day);
-        let new_total = withdrawn_today.saturating_add(amount);
+        // Record only exact totals; saturating here could silently undercount
+        // withdrawals and bypass a configured daily limit.
+        let new_total = withdrawn_today
+            .checked_add(amount)
+            .ok_or(Error::ArithmeticOverflow)?;
 
         if let Some(daily_limit) = env
             .storage()
@@ -1821,8 +1827,10 @@ impl Stellar_CardReceiver {
     /// * `amount` - The original payment amount
     ///
     /// # Returns
-    /// Net amount after discount (amount - (amount * discount_bps / 10000))
-    fn apply_discount(env: &Env, account: &Address, amount: i128) -> i128 {
+    /// Net amount after discount (amount - (amount * discount_bps / 10000)).
+    /// Splitting amount into quotient and remainder avoids overflowing the
+    /// intermediate product for large, otherwise valid payment amounts.
+    fn apply_discount(env: &Env, account: &Address, amount: i128) -> Result<i128, Error> {
         let discount_bps = env
             .storage()
             .persistent()
@@ -1830,15 +1838,21 @@ impl Stellar_CardReceiver {
             .unwrap_or(0);
 
         if discount_bps == 0 {
-            return amount;
+            return Ok(amount);
         }
 
-        // Calculate discount: amount * discount_bps / 10000
-        // Use saturating_sub to prevent underflow
-        let discount = amount
-            .saturating_mul(discount_bps as i128)
-            .saturating_div(10000);
-        amount.saturating_sub(discount)
+        let basis_points = i128::from(discount_bps);
+        let discount = (amount / 10_000)
+            .checked_mul(basis_points)
+            .and_then(|whole| {
+                (amount % 10_000)
+                    .checked_mul(basis_points)
+                    .and_then(|fraction| whole.checked_add(fraction / 10_000))
+            })
+            .ok_or(Error::ArithmeticOverflow)?;
+        amount
+            .checked_sub(discount)
+            .ok_or(Error::ArithmeticOverflow)
     }
 }
 
@@ -5139,7 +5153,12 @@ mod test {
         let result = f
             .client()
             .try_rescue_tokens(&f.admin, &f.usdc, &destination, &0_i128);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+        assert_eq!(
+            f.client()
+                .try_rescue_tokens(&f.admin, &f.usdc, &destination, &-1_i128),
+            Err(Ok(Error::InvalidAmount))
+        );
     }
 
     #[test]
@@ -5175,6 +5194,23 @@ mod test {
         let f = Fixture::new();
         f.init();
         assert_eq!(f.client().withdraw_limits(), (None, None));
+    }
+
+    #[test]
+    fn test_rescue_tokens_returns_arithmetic_overflow_for_daily_total() {
+        let f = Fixture::new();
+        f.init();
+        let day = Stellar_CardReceiver::current_day(&f.env);
+        f.env.as_contract(&f.contract_id, || {
+            Stellar_CardReceiver::set_withdrawn(&f.env, day, i128::MAX);
+        });
+
+        let destination = Address::generate(&f.env);
+        assert_eq!(
+            f.client()
+                .try_rescue_tokens(&f.admin, &f.usdc, &destination, &1_i128),
+            Err(Ok(Error::ArithmeticOverflow))
+        );
     }
 
     #[test]
@@ -6892,6 +6928,7 @@ mod test {
         assert_eq!(Error::DailyWithdrawLimitExceeded as u32, 5);
         assert_eq!(Error::InvalidRecipient as u32, 6);
         assert_eq!(Error::InvalidDiscount as u32, 7);
+        assert_eq!(Error::ArithmeticOverflow as u32, 8);
     }
 
     /// The crate docs state `TOKEN_DECIMALS` is 7 and that the TTL threshold
@@ -7125,6 +7162,20 @@ mod test {
         // Treasury should receive 75% of the amount (25% discount)
         let expected = 15_000_000;
         assert_eq!(f.xlm_balance(&f.treasury), expected);
+    }
+
+    #[test]
+    fn test_discount_calculation_handles_i128_max_without_intermediate_overflow() {
+        let f = Fixture::new();
+        f.init();
+
+        let vip = Address::generate(&f.env);
+        f.client().set_discount(&f.admin, &vip, &5000);
+        f.mint_usdc(&vip, i128::MAX);
+        f.client()
+            .pay_usdc(&vip, &i128::MAX, &order_bytes(&f.env, "max-discount"));
+
+        assert_eq!(f.usdc_balance(&f.treasury), i128::MAX - (i128::MAX / 2));
     }
 
     #[test]
