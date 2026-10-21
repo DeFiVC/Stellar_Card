@@ -6394,4 +6394,105 @@ mod test {
         assert_eq!(TOKEN_DECIMALS, 7);
         assert_eq!(INSTANCE_TTL_THRESHOLD * 2, INSTANCE_TTL_MAX);
     }
+
+    // ── decommission tests (Issue #671) ───────────────────────────────────────
+
+    fn decommissioned_fixture() -> Fixture {
+        let f = Fixture::new();
+        f.init();
+        f.client().decommission(&Vec::new(&f.env));
+        f
+    }
+
+    #[test]
+    fn test_decommission_sets_permanent_pause_and_sweeps_balances() {
+        let f = Fixture::new();
+        f.init();
+        f.mint_usdc(&f.contract_id, 500);
+        f.mint_xlm(&f.contract_id, 300);
+
+        f.client().decommission(&Vec::new(&f.env));
+
+        assert!(f.client().is_decommissioned_view());
+        assert!(f.client().is_paused_view());
+        assert_eq!(f.usdc_balance(&f.contract_id), 0);
+        assert_eq!(f.xlm_balance(&f.contract_id), 0);
+        assert_eq!(f.usdc_balance(&f.treasury), 500);
+        assert_eq!(f.xlm_balance(&f.treasury), 300);
+        assert_eq!(
+            contract_event_count(&f.env, &f.contract_id, "contract_decommissioned"),
+            1
+        );
+    }
+
+    #[test]
+    fn test_decommission_sweeps_extra_tokens() {
+        let f = Fixture::new();
+        f.init();
+        let other = f
+            .env
+            .register_stellar_asset_contract_v2(f.admin.clone())
+            .address();
+        token::StellarAssetClient::new(&f.env, &other).mint(&f.contract_id, &42);
+
+        let mut extra = Vec::new(&f.env);
+        extra.push_back(other.clone());
+        f.client().decommission(&extra);
+
+        let other_client = token::Client::new(&f.env, &other);
+        assert_eq!(other_client.balance(&f.contract_id), 0);
+        assert_eq!(other_client.balance(&f.treasury), 42);
+    }
+
+    #[test]
+    fn test_payments_rejected_after_decommission() {
+        let f = decommissioned_fixture();
+        f.mint_usdc(&f.payer, 100);
+        f.mint_xlm(&f.payer, 100);
+        let order = order_bytes(&f.env, "order-1");
+        assert_eq!(
+            f.client().try_pay_usdc(&f.payer, &10, &order),
+            Err(Ok(Error::ContractDecommissioned))
+        );
+        assert_eq!(
+            f.client().try_pay_xlm(&f.payer, &10, &order),
+            Err(Ok(Error::ContractDecommissioned))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "contract is decommissioned")]
+    fn test_unpause_locked_after_decommission() {
+        decommissioned_fixture().client().unpause();
+    }
+
+    #[test]
+    #[should_panic(expected = "contract is decommissioned")]
+    fn test_decommission_cannot_run_twice() {
+        let f = decommissioned_fixture();
+        f.client().decommission(&Vec::new(&f.env));
+    }
+
+    #[test]
+    fn test_admin_functions_locked_after_decommission() {
+        let f = decommissioned_fixture();
+        let other = Address::generate(&f.env);
+        let c = f.client();
+        assert!(c.try_pause(&f.admin).is_err());
+        assert!(c.try_upgrade(&BytesN::from_array(&f.env, &[0u8; 32])).is_err());
+        assert!(c
+            .try_rescue_tokens(&f.admin, &f.usdc, &other, &1)
+            .is_err());
+        assert!(c.try_set_withdraw_limits(&f.admin, &None, &None).is_err());
+        assert!(c.try_transfer_admin(&other).is_err());
+        assert!(c.try_grant_role(&other, &Role::Operator).is_err());
+        assert!(c.try_revoke_role(&other).is_err());
+        assert!(c.is_decommissioned_view());
+        assert!(c.is_paused_view());
+    }
+
+    #[test]
+    fn test_contract_decommissioned_error_code() {
+        assert_eq!(Error::ContractDecommissioned as u32, 7);
+    }
 }
