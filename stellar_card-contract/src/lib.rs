@@ -50,20 +50,22 @@
 //! each event as a real state transition. The first topic is always the
 //! event name:
 //!
-//! | Event                 | Topics                            | Data                                      |
-//! |-----------------------|-----------------------------------|-------------------------------------------|
-//! | `init`                | `admin`                           | `(treasury, usdc_contract, xlm_contract)` |
-//! | `pay_usdc`            | `order_id`, `from`                | `amount`                                  |
-//! | `pay_xlm`             | `order_id`, `from`                | `amount`                                  |
-//! | `paused`              | `caller`                          | `true`                                    |
-//! | `unpaused`            | `admin`                           | `false`                                   |
-//! | `upgraded`            | `admin`                           | `new_wasm_hash`                           |
-//! | `tokens_rescued`      | `token_contract`, `to`            | `(caller, amount)`                        |
-//! | `withdraw_limits_set` | `caller`                          | `(per_call, per_day)`                     |
-//! | `admin_transferred`   | `old_admin`, `new_admin`          | `()`                                      |
-//! | `role_granted`        | `address`                         | `role`                                    |
-//! | `role_revoked`        | `address`                         | `()`                                      |
-//! | `role_renounced`      | `caller`                          | `()`                                      |
+//! | Event                    | Topics                                        | Data                                      |
+//! |--------------------------|-----------------------------------------------|-------------------------------------------|
+//! | `init`                   | `admin`                                       | `(treasury, usdc_contract, xlm_contract)` |
+//! | `pay_usdc`               | `order_id`, `from`                            | `amount`                                  |
+//! | `pay_xlm`                | `order_id`, `from`                            | `amount`                                  |
+//! | `paused`                 | `caller`                                      | `true`                                    |
+//! | `unpaused`               | `admin`                                       | `false`                                   |
+//! | `upgraded`               | `admin`                                       | `new_wasm_hash`                           |
+//! | `tokens_rescued`         | `token_contract`, `to`                        | `(caller, amount)`                        |
+//! | `withdraw_limits_set`    | `caller`                                      | `(per_call, per_day)`                     |
+//! | `treasury_updated`       | `old_treasury`, `new_treasury`                | `admin`                                   |
+//! | `token_contract_updated` | `asset_symbol`, `old_contract`, `new_contract`| `admin`                                   |
+//! | `admin_transferred`      | `old_admin`, `new_admin`                      | `()`                                      |
+//! | `role_granted`           | `address`                                     | `role`                                    |
+//! | `role_revoked`           | `address`                                     | `()`                                      |
+//! | `role_renounced`         | `caller`                                      | `()`                                      |
 //!
 //! `transfer_admin` also moves the `Admin` role, so it is preceded by a
 //! `role_revoked` for the old admin (when it held `Admin`) and a
