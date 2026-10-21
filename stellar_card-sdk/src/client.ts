@@ -27,6 +27,8 @@ import {
   withRequestTimeout,
   sanitizeHeaders,
   mergeHeaders,
+  RequestThrottle,
+  RequestPriority,
   type RequestOptions,
 } from './network';
 import { validateClientOptions, validateCreateOrderInput } from './validation';
@@ -205,6 +207,25 @@ export interface ReportStatusOptions extends RequestOptions {
   detail?: string;
 }
 
+/** A single entry from `GET /dashboard/audit` (#731). */
+export interface AuditLogEntry {
+  id: string;
+  timestamp: string;
+  action: string;
+  actor: string;
+  result: 'success' | 'failure' | string;
+  detail?: string;
+}
+
+export interface ListAuditLogsOptions extends RequestOptions {
+  /** Filter by action name, e.g. `"order.create"`. */
+  action?: string;
+  /** Page size. Defaults to 20. */
+  limit?: number;
+  /** ISO-8601 lower bound on `timestamp`. */
+  since?: string;
+}
+
 export interface StellarCardClientOptions {
   baseUrl?: string;
   apiKey?: string;
@@ -223,6 +244,16 @@ export interface StellarCardClientOptions {
   disableVersionCheck?: boolean;
   /** Enable anonymous SDK telemetry. Disabled unless explicitly opted in. */
   telemetry?: boolean;
+  /**
+   * Client-side throttle for outgoing API/Horizon requests (#728). When
+   * set, requests queue automatically once this many requests have
+   * started within the current 1-second sliding window, instead of
+   * firing immediately and risking a Horizon 429. Transaction-submission
+   * requests are prioritized ahead of routine polling/read requests
+   * within the queue. Unset (default) disables throttling entirely —
+   * existing callers see no behavior change.
+   */
+  maxRequestsPerSecond?: number;
 }
 
 export interface WaitForOrderFulfillmentOptions extends RequestOptions {
@@ -277,6 +308,8 @@ export class Stellar_CardClient {
   private network: 'mainnet' | 'testnet' | 'futurenet';
   private headers: Record<string, string>;
   private telemetry: TelemetryCollector;
+  /** Set only when `maxRequestsPerSecond` is configured; undefined means throttling is off. */
+  private throttle?: RequestThrottle;
 
   /**
    * Create a client from explicit options, env vars, or on-disk config.
@@ -311,6 +344,10 @@ export class Stellar_CardClient {
     this.timeout = options.timeout ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.network = options.network ?? 'mainnet';
     this.headers = sanitizeHeaders(headers);
+    this.throttle =
+      options.maxRequestsPerSecond !== undefined
+        ? new RequestThrottle({ maxRequestsPerSecond: options.maxRequestsPerSecond })
+        : undefined;
 
     // Resolve api key + base URL in priority order:
     //   1. Explicit constructor args
@@ -400,6 +437,21 @@ export class Stellar_CardClient {
     return status === 429 || status === 503 || status === 504 || status === 502 || status === 0;
   }
 
+  /**
+   * Classify a request for the (optional) client-side throttle queue.
+   * POSTs to the order-creation endpoint submit a payment/transaction
+   * flow and are latency-sensitive, so they jump the queue ahead of
+   * routine GET polling (status/usage/list) when `maxRequestsPerSecond`
+   * is configured. See {@link RequestThrottle}.
+   */
+  private classifyPriority(url: string, init: RequestInit): RequestPriority {
+    const method = (init.method ?? 'GET').toUpperCase();
+    if (method === 'POST' && /\/orders(\?|$)/.test(url)) {
+      return RequestPriority.Critical;
+    }
+    return RequestPriority.Normal;
+  }
+
   private async fetchWithRetry(
     url: string,
     init: RequestInit,
@@ -417,12 +469,14 @@ export class Stellar_CardClient {
       ...init,
       headers: finalHeaders,
     };
+    const priority = this.classifyPriority(url, init);
 
     for (let i = 0; i <= attempts; i++) {
       try {
+        const doFetch = (s: AbortSignal) => fetch(url, { ...mergedInit, signal: s });
         const res = await withRequestTimeout(
           operation,
-          (s) => fetch(url, { ...mergedInit, signal: s }),
+          (s) => (this.throttle ? this.throttle.schedule(() => doFetch(s), priority) : doFetch(s)),
           {
             timeout,
             signal,
@@ -956,6 +1010,38 @@ export class Stellar_CardClient {
     );
     if (!res.ok) return this.handleError(res);
     return res.json() as Promise<UsageSummary>;
+  }
+
+  /**
+   * List recent audit events (API calls, card authorizations, webhook
+   * deliveries) for the dashboard tied to this API key (#731).
+   *
+   * @param opts.action - Filter by action name, e.g. `"order.create"`.
+   * @param opts.limit - Page size. Defaults to 20.
+   * @param opts.since - ISO-8601 lower bound on `timestamp`.
+   * @returns Audit log entries, most recent first.
+   * @throws {AuthError} When the API key is invalid.
+   */
+  async getAuditLogs({
+    action,
+    limit = 20,
+    since,
+    timeout,
+    signal,
+  }: ListAuditLogsOptions = {}): Promise<AuditLogEntry[]> {
+    const normalizedLimit = normalizeIntegerOption('limit', limit, 20);
+    const params = new URLSearchParams();
+    if (action) params.set('action', action);
+    params.set('limit', String(normalizedLimit));
+    if (since) params.set('since', since);
+    const qs = params.toString() ? `?${params}` : '';
+    const res = await this.fetchWithRetry(
+      `${this.baseUrl}/dashboard/audit${qs}`,
+      { headers: { 'X-Api-Key': this.apiKey } },
+      { timeout, signal },
+    );
+    if (!res.ok) return this.handleError(res);
+    return res.json() as Promise<AuditLogEntry[]>;
   }
 
   /**

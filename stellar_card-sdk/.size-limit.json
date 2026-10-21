@@ -1,0 +1,16 @@
+[
+  {
+    "name": "Browser bundle (dist/browser.js)",
+    "path": "dist/browser.js",
+    "limit": "50 KB",
+    "gzip": true,
+    "ignore": ["@stellar/stellar-sdk", "zod", "@modelcontextprotocol/sdk"]
+  },
+  {
+    "name": "React hooks (stellar_card/react)",
+    "path": "dist/integrations/react.js",
+    "limit": "20 KB",
+    "gzip": true,
+    "ignore": ["react", "react-dom", "@stellar/stellar-sdk", "zod", "@modelcontextprotocol/sdk"]
+  }
+]

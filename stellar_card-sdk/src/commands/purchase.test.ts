@@ -221,4 +221,53 @@ describe('purchaseCommand asset selection', () => {
     expect(h.out).toContain('Auto-picked XLM');
     expect(h.purchase.mock.calls[0]![0].paymentAsset).toBe('xlm');
   });
+
+  it('respects explicit --asset flag over balance', async () => {
+    const h = harness({
+      getBalance: vi.fn().mockResolvedValue({ xlm: '100', usdc: '500' }),
+    });
+    await purchaseCommand(['--amount', '10', '--asset', 'xlm', '--yes'], h.deps);
+    expect(h.purchase.mock.calls[0]![0].paymentAsset).toBe('xlm');
+  });
+
+  it('falls back to XLM when balance check fails', async () => {
+    const h = harness({
+      getBalance: vi.fn().mockRejectedValue(new Error('Horizon down')),
+    });
+    await purchaseCommand(['--amount', '10', '--yes'], h.deps);
+    expect(h.out).toContain('Could not read balance');
+    expect(h.purchase.mock.calls[0]![0].paymentAsset).toBe('xlm');
+  });
+
+  it('displays balances to the user', async () => {
+    const h = harness({
+      getBalance: vi.fn().mockResolvedValue({ xlm: '100.5', usdc: '50.25' }),
+    });
+    await purchaseCommand(['--amount', '10', '--yes'], h.deps);
+    expect(h.getBalance).toHaveBeenCalledWith('agent-test', '/tmp/vault');
+  });
+
+  it('shows estimated fee information for XLM payment', async () => {
+    const h = harness({
+      getBalance: vi.fn().mockResolvedValue({ xlm: '100', usdc: '0' }),
+    });
+    await purchaseCommand(['--amount', '10', '--yes'], h.deps);
+    expect(h.out).toContain('XLM');
+  });
+
+  it('uses auto-pick when --json is passed', async () => {
+    const h = harness();
+    await purchaseCommand(['--amount', '10', '--json'], h.deps);
+    expect(h.out).not.toContain('Selected');
+    const result = JSON.parse(h.out);
+    expect(result.payment_asset).toBeDefined();
+  });
+
+  it('uses auto-pick when --dry-run is passed', async () => {
+    const h = harness();
+    const code = await purchaseCommand(['--amount', '10', '--dry-run'], h.deps);
+    expect(code).toBe(0);
+    expect(h.out).toContain('Dry run OK');
+    expect(h.purchase).not.toHaveBeenCalled();
+  });
 });

@@ -651,3 +651,189 @@ function normalizeString(value: string | undefined): string | undefined {
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
 }
+
+// ── Client-side request throttle queue (#728) ───────────────────────────────
+//
+// A sliding-window token-bucket limiter for outgoing Horizon / API
+// requests, so batch SDK usage (e.g. polling many orders, or fanning out
+// balance checks for many agent wallets) doesn't trip Horizon's 429
+// rate limiting. Requests above the configured `maxRequestsPerSecond`
+// are queued rather than rejected, and critical requests (transaction
+// submission) jump ahead of routine polling requests in that queue.
+
+/** Relative priority of a throttled request. Higher runs first. */
+export enum RequestPriority {
+  /** Routine polling / read queries (order status, balances, listings). */
+  Normal = 0,
+  /** Transaction-submission or other critical, latency-sensitive calls. */
+  Critical = 10,
+}
+
+/** Options accepted by {@link RequestThrottle}. */
+export interface RequestThrottleOptions {
+  /**
+   * Maximum number of requests allowed to start within any rolling
+   * `windowMs` window. Must be a positive integer. Defaults to 10,
+   * matching Horizon's common default rate limit guidance.
+   */
+  maxRequestsPerSecond?: number;
+  /** Size of the sliding window, in ms. Defaults to 1000 (1 second). */
+  windowMs?: number;
+  /** Optional logger for queue/throttle diagnostics. */
+  logger?: Logger;
+}
+
+interface QueuedTask<T> {
+  priority: RequestPriority;
+  /** Monotonic sequence number — preserves FIFO order within the same priority. */
+  seq: number;
+  run: () => Promise<T>;
+  resolve: (value: T) => void;
+  reject: (err: unknown) => void;
+}
+
+/**
+ * Client-side sliding-window token-bucket request throttle.
+ *
+ * Call {@link RequestThrottle.schedule} to run a function under the
+ * throttle instead of calling it directly. When the configured rate is
+ * already saturated, the call is queued (in priority order, then FIFO)
+ * and runs as soon as the sliding window has room again — it is never
+ * rejected outright, matching the issue's "auto-queue" requirement
+ * rather than a hard reject-on-429-risk policy.
+ *
+ * @example
+ * ```typescript
+ * const throttle = new RequestThrottle({ maxRequestsPerSecond: 10 });
+ *
+ * // Routine polling — queues behind critical requests under load.
+ * const order = await throttle.schedule(() => client.getOrder(id));
+ *
+ * // Transaction submission — jumps ahead of queued polling requests.
+ * const result = await throttle.schedule(
+ *   () => submitPayment(tx),
+ *   RequestPriority.Critical,
+ * );
+ * ```
+ */
+export class RequestThrottle {
+  private readonly maxPerWindow: number;
+  private readonly windowMs: number;
+  private readonly logger?: Logger;
+
+  /** Start timestamps (ms) of requests that began within the current window. */
+  private timestamps: number[] = [];
+  private queue: QueuedTask<unknown>[] = [];
+  private seqCounter = 0;
+  private draining = false;
+
+  constructor(options: RequestThrottleOptions = {}) {
+    const maxRequestsPerSecond = options.maxRequestsPerSecond ?? 10;
+    if (!Number.isInteger(maxRequestsPerSecond) || maxRequestsPerSecond < 1) {
+      throw new ValidationError('maxRequestsPerSecond', 'must be a positive integer when provided');
+    }
+    const windowMs = options.windowMs ?? 1000;
+    if (!Number.isInteger(windowMs) || windowMs < 1) {
+      throw new ValidationError('windowMs', 'must be a positive integer when provided');
+    }
+    this.maxPerWindow = maxRequestsPerSecond;
+    this.windowMs = windowMs;
+    this.logger = options.logger;
+  }
+
+  /** Current configured rate limit (requests per window). */
+  get limit(): number {
+    return this.maxPerWindow;
+  }
+
+  /** Number of tasks currently waiting in the queue (not yet started). */
+  get queueLength(): number {
+    return this.queue.length;
+  }
+
+  /** Drop timestamps that have fallen outside the sliding window. */
+  private pruneWindow(now: number): void {
+    const cutoff = now - this.windowMs;
+    let i = 0;
+    while (i < this.timestamps.length && this.timestamps[i] <= cutoff) i++;
+    if (i > 0) this.timestamps.splice(0, i);
+  }
+
+  /** Whether a new request may start immediately under the current window. */
+  private hasCapacity(now: number): boolean {
+    this.pruneWindow(now);
+    return this.timestamps.length < this.maxPerWindow;
+  }
+
+  /**
+   * Schedule `fn` to run under this throttle. Resolves/rejects with
+   * whatever `fn` resolves/rejects with, once it has actually run.
+   *
+   * @param fn - The request to run once throttle capacity allows it.
+   * @param priority - {@link RequestPriority.Critical} requests are
+   *   dequeued ahead of {@link RequestPriority.Normal} ones. Defaults
+   *   to Normal (routine polling/read traffic).
+   */
+  schedule<T>(
+    fn: () => Promise<T>,
+    priority: RequestPriority = RequestPriority.Normal,
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const task: QueuedTask<T> = {
+        priority,
+        seq: this.seqCounter++,
+        run: fn,
+        resolve,
+        reject,
+      };
+      // Insert in priority order (higher priority first), FIFO within
+      // the same priority — a simple sorted-insert is fine at the
+      // queue depths this throttle is meant for (batch SDK calls, not
+      // a high-throughput message broker).
+      let insertAt = this.queue.length;
+      for (let i = 0; i < this.queue.length; i++) {
+        if (this.queue[i].priority < task.priority) {
+          insertAt = i;
+          break;
+        }
+      }
+      this.queue.splice(insertAt, 0, task as QueuedTask<unknown>);
+      this.logger?.debug?.(
+        `RequestThrottle: queued (priority=${priority}, queueLength=${this.queue.length})`,
+      );
+      void this.drain();
+    });
+  }
+
+  /** Process the queue, starting as many tasks as current capacity allows. */
+  private async drain(): Promise<void> {
+    if (this.draining) return;
+    this.draining = true;
+    try {
+      while (this.queue.length > 0) {
+        const now = Date.now();
+        if (!this.hasCapacity(now)) {
+          // Wait until the oldest timestamp in the window falls out of it,
+          // then re-check — avoids a busy-loop while still being responsive
+          // to new headroom as soon as it exists.
+          const oldest = this.timestamps[0];
+          const waitMs = Math.max(1, oldest + this.windowMs - now);
+          this.logger?.debug?.(`RequestThrottle: at capacity, waiting ${waitMs}ms`);
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        }
+        const task = this.queue.shift();
+        if (!task) continue;
+        this.timestamps.push(Date.now());
+        // Run without awaiting here — tasks run concurrently once
+        // admitted, only their *start* is rate-limited. Awaiting would
+        // serialize unrelated requests behind each other's full
+        // round-trip latency, which the "throttle," not "mutex," intent
+        // of this queue does not call for.
+        task.run().then(task.resolve, task.reject);
+      }
+    } finally {
+      this.draining = false;
+    }
+  }
+}
