@@ -207,6 +207,25 @@ export interface ReportStatusOptions extends RequestOptions {
   detail?: string;
 }
 
+/** A single entry from `GET /dashboard/audit` (#731). */
+export interface AuditLogEntry {
+  id: string;
+  timestamp: string;
+  action: string;
+  actor: string;
+  result: 'success' | 'failure' | string;
+  detail?: string;
+}
+
+export interface ListAuditLogsOptions extends RequestOptions {
+  /** Filter by action name, e.g. `"order.create"`. */
+  action?: string;
+  /** Page size. Defaults to 20. */
+  limit?: number;
+  /** ISO-8601 lower bound on `timestamp`. */
+  since?: string;
+}
+
 export interface StellarCardClientOptions {
   baseUrl?: string;
   apiKey?: string;
@@ -991,6 +1010,38 @@ export class Stellar_CardClient {
     );
     if (!res.ok) return this.handleError(res);
     return res.json() as Promise<UsageSummary>;
+  }
+
+  /**
+   * List recent audit events (API calls, card authorizations, webhook
+   * deliveries) for the dashboard tied to this API key (#731).
+   *
+   * @param opts.action - Filter by action name, e.g. `"order.create"`.
+   * @param opts.limit - Page size. Defaults to 20.
+   * @param opts.since - ISO-8601 lower bound on `timestamp`.
+   * @returns Audit log entries, most recent first.
+   * @throws {AuthError} When the API key is invalid.
+   */
+  async getAuditLogs({
+    action,
+    limit = 20,
+    since,
+    timeout,
+    signal,
+  }: ListAuditLogsOptions = {}): Promise<AuditLogEntry[]> {
+    const normalizedLimit = normalizeIntegerOption('limit', limit, 20);
+    const params = new URLSearchParams();
+    if (action) params.set('action', action);
+    params.set('limit', String(normalizedLimit));
+    if (since) params.set('since', since);
+    const qs = params.toString() ? `?${params}` : '';
+    const res = await this.fetchWithRetry(
+      `${this.baseUrl}/dashboard/audit${qs}`,
+      { headers: { 'X-Api-Key': this.apiKey } },
+      { timeout, signal },
+    );
+    if (!res.ok) return this.handleError(res);
+    return res.json() as Promise<AuditLogEntry[]>;
   }
 
   /**

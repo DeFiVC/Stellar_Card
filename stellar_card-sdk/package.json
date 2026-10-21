@@ -39,6 +39,11 @@
       "types": "./dist/hardware.d.ts",
       "import": "./dist/esm/hardware.js",
       "require": "./dist/hardware.js"
+    },
+    "./react": {
+      "types": "./dist/integrations/react.d.ts",
+      "import": "./dist/esm/integrations/react.js",
+      "require": "./dist/integrations/react.js"
     }
   },
   "browser": {
@@ -77,6 +82,7 @@
     "typecheck": "tsc --noEmit && tsc -p tsconfig.esm.json --noEmit",
     "test": "vitest run",
     "check:browser": "node scripts/check-browser-deps.mjs",
+    "size": "size-limit",
     "verify:package": "node scripts/verify-package.mjs",
     "prepare": "node scripts/prepare.mjs",
     "prepublishOnly": "npm run build && npm test && npm run check:browser && npm run verify:package"
@@ -120,6 +126,9 @@
       ],
       "hardware": [
         "./dist/hardware.d.ts"
+      ],
+      "react": [
+        "./dist/integrations/react.d.ts"
       ]
     }
   },
@@ -139,6 +148,14 @@
   },
   "overrides": {
     "axios": "^1.15.0"
+  },
+  "peerDependencies": {
+    "react": "^18.0.0 || ^19.0.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
   },
   "dependencies": {
     "@ctx.com/stellar-ows-core": "^1.3.0-stellar",
@@ -162,13 +179,20 @@
     "@commitlint/cli": "^19.0.0",
     "@commitlint/config-conventional": "^19.0.0",
     "@eslint/js": "^9.39.0",
+    "@testing-library/react": "^16.3.0",
     "@types/node": "^22.0.0",
+    "@types/react": "^18.3.0",
     "@vitest/coverage-v8": "^4.1.5",
     "eslint": "^9.39.0",
     "globals": "^17.0.0",
     "husky": "^9.0.0",
+    "jsdom": "^30.1.0",
     "lint-staged": "^15.2.0",
     "prettier": "^3.9.0",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "size-limit": "^11.1.6",
+    "@size-limit/preset-small-lib": "^11.1.6",
     "typescript": "^6.0.0",
     "typescript-eslint": "^8.65.0",
     "vitest": "^4.1.5",
