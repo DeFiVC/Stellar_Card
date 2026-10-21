@@ -255,8 +255,10 @@ pub enum Error {
     ContractDecommissioned = 7,
     /// Discount value exceeds the maximum allowed (10000 basis points = 100%)
     InvalidDiscount = 7,
+    /// Payment metadata exceeds the 64-byte limit
+    InvalidMetadata = 8,
     /// A financial calculation exceeded the range of its integer type
-    ArithmeticOverflow = 8,
+    ArithmeticOverflow = 9,
 }
 
 /// The stellar_card card receiver contract.
@@ -785,6 +787,56 @@ impl Stellar_CardReceiver {
         Ok(())
     }
 
+    /// Transfers USDC and emits optional routing metadata with the payment event.
+    /// Metadata is limited to 64 bytes; the standard `pay_usdc` event remains unchanged.
+    pub fn pay_usdc_with_memo(
+        env: Env,
+        from: Address,
+        amount: i128,
+        order_id: Bytes,
+        metadata: Bytes,
+    ) -> Result<(), Error> {
+        if metadata.len() > 64 {
+            return Err(Error::InvalidMetadata);
+        }
+        if Self::is_decommissioned(&env) {
+            return Err(Error::ContractDecommissioned);
+        }
+        if Self::is_paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if Self::is_blacklisted(&env, &from) {
+            return Err(Error::AddressBlacklisted);
+        }
+        from.require_auth();
+
+        let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+        let usdc_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::UsdcContract)
+            .unwrap();
+        let net_amount = Self::apply_discount(&env, &from, amount);
+        let transferred = Self::with_reentrancy_guard(&env, || {
+            token::Client::new(&env, &usdc_contract)
+                .try_transfer(&from, &treasury, &net_amount)
+                .is_ok()
+        });
+        if !transferred {
+            return Err(Error::TransferFailed);
+        }
+
+        env.events().publish(
+            (symbol_short!("pay_usdc"), order_id, from),
+            (amount, metadata),
+        );
+        Self::extend_instance_ttl(&env);
+        Ok(())
+    }
+
     /// Transfers XLM tokens from a payer to the contract treasury.
     ///
     /// # Arguments
@@ -848,6 +900,52 @@ impl Stellar_CardReceiver {
         env.events()
             .publish((symbol_short!("pay_xlm"), order_id, from), amount);
 
+        Self::extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Transfers XLM and emits optional routing metadata with the payment event.
+    /// Metadata is limited to 64 bytes; the standard `pay_xlm` event remains unchanged.
+    pub fn pay_xlm_with_memo(
+        env: Env,
+        from: Address,
+        amount: i128,
+        order_id: Bytes,
+        metadata: Bytes,
+    ) -> Result<(), Error> {
+        if metadata.len() > 64 {
+            return Err(Error::InvalidMetadata);
+        }
+        if Self::is_decommissioned(&env) {
+            return Err(Error::ContractDecommissioned);
+        }
+        if Self::is_paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if Self::is_blacklisted(&env, &from) {
+            return Err(Error::AddressBlacklisted);
+        }
+        from.require_auth();
+
+        let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+        let xlm_contract: Address = env.storage().instance().get(&DataKey::XlmContract).unwrap();
+        let net_amount = Self::apply_discount(&env, &from, amount);
+        let transferred = Self::with_reentrancy_guard(&env, || {
+            token::Client::new(&env, &xlm_contract)
+                .try_transfer(&from, &treasury, &net_amount)
+                .is_ok()
+        });
+        if !transferred {
+            return Err(Error::TransferFailed);
+        }
+
+        env.events().publish(
+            (symbol_short!("pay_xlm"), order_id, from),
+            (amount, metadata),
+        );
         Self::extend_instance_ttl(&env);
         Ok(())
     }
@@ -2453,6 +2551,64 @@ mod test {
             break;
         }
         assert!(found, "pay_usdc event not found");
+    }
+
+    #[test]
+    fn test_pay_usdc_with_memo_emits_metadata_and_accepts_empty_metadata() {
+        let f = Fixture::new();
+        f.init();
+        let amount = 100_i128;
+        f.mint_usdc(&f.payer, amount * 2);
+
+        let empty = Bytes::new(&f.env);
+        f.client().pay_usdc_with_memo(
+            &f.payer,
+            &amount,
+            &order_bytes(&f.env, "empty-metadata"),
+            &empty,
+        );
+        let metadata = order_bytes(&f.env, "route-a");
+        let order_id = order_bytes(&f.env, "tagged-metadata");
+        f.client()
+            .pay_usdc_with_memo(&f.payer, &amount, &order_id, &metadata);
+
+        let (_, _, data) = f.env.events().all().last().unwrap();
+        let (emitted_amount, emitted_metadata): (i128, Bytes) =
+            data.try_into_val(&f.env).unwrap();
+        assert_eq!(emitted_amount, amount);
+        assert_eq!(emitted_metadata, metadata);
+    }
+
+    #[test]
+    fn test_pay_xlm_with_memo_accepts_metadata_and_rejects_oversized_metadata() {
+        let f = Fixture::new();
+        f.init();
+        let amount = 100_i128;
+        f.mint_xlm(&f.payer, amount);
+        let metadata = order_bytes(&f.env, "xlm-route");
+
+        f.client().pay_xlm_with_memo(
+            &f.payer,
+            &amount,
+            &order_bytes(&f.env, "xlm-metadata"),
+            &metadata,
+        );
+        let (_, _, data) = f.env.events().all().last().unwrap();
+        let (emitted_amount, emitted_metadata): (i128, Bytes) =
+            data.try_into_val(&f.env).unwrap();
+        assert_eq!(emitted_amount, amount);
+        assert_eq!(emitted_metadata, metadata);
+
+        let oversized = Bytes::from_slice(&f.env, &[0; 65]);
+        assert_eq!(
+            f.client().try_pay_xlm_with_memo(
+                &f.payer,
+                &amount,
+                &order_bytes(&f.env, "oversized-metadata"),
+                &oversized,
+            ),
+            Err(Ok(Error::InvalidMetadata))
+        );
     }
 
     #[test]
@@ -6928,7 +7084,8 @@ mod test {
         assert_eq!(Error::DailyWithdrawLimitExceeded as u32, 5);
         assert_eq!(Error::InvalidRecipient as u32, 6);
         assert_eq!(Error::InvalidDiscount as u32, 7);
-        assert_eq!(Error::ArithmeticOverflow as u32, 8);
+        assert_eq!(Error::InvalidMetadata as u32, 8);
+    assert_eq!(Error::ArithmeticOverflow as u32, 9);
     }
 
     /// The crate docs state `TOKEN_DECIMALS` is 7 and that the TTL threshold
