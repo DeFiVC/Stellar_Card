@@ -204,6 +204,10 @@ pub enum DataKey {
     /// full by every call, so that growth taxed every payment forever. This
     /// single slot is overwritten in place, keeping the footprint constant.
     DailyWithdrawn,
+    /// Emergency killswitch (Issue #671): set to `true` by `decommission`
+    /// and never cleared. Once present, the contract is permanently paused
+    /// and every payment and administrative entrypoint is locked out.
+    Decommissioned,
     /// Per-address fee discount in basis points (1 bps = 0.01%). Stored only
     /// for accounts with an active discount; absence means no discount (0 bps).
     /// Maximum 10000 bps (100% discount). Persistent storage, per-address key
@@ -235,6 +239,8 @@ pub enum Error {
     /// `rescue_tokens` recipient is the contract itself, which would move
     /// nothing while still spending the day's withdraw budget
     InvalidRecipient = 6,
+    /// The contract has been permanently decommissioned (Issue #671)
+    ContractDecommissioned = 7,
     /// Discount value exceeds the maximum allowed (10000 basis points = 100%)
     InvalidDiscount = 7,
 }
@@ -557,6 +563,7 @@ impl Stellar_CardReceiver {
     /// `caller.require_auth()` fails.
     pub fn pause(env: Env, caller: Address) {
         caller.require_auth();
+        Self::require_not_decommissioned(&env);
         if !Self::has_authority(&env, &caller, Role::Operator) {
             panic!("pause requires at least the Operator role");
         }
@@ -592,6 +599,7 @@ impl Stellar_CardReceiver {
     pub fn unpause(env: Env) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        Self::require_not_decommissioned(&env);
         if !Self::is_paused(&env) {
             return;
         }
@@ -668,6 +676,9 @@ impl Stellar_CardReceiver {
     /// Panics if called before `init`, if `from.require_auth()` fails, or
     /// with "reentrancy detected" if invoked from inside another guarded call.
     pub fn pay_usdc(env: Env, from: Address, amount: i128, order_id: Bytes) -> Result<(), Error> {
+        if Self::is_decommissioned(&env) {
+            return Err(Error::ContractDecommissioned);
+        }
         if Self::is_paused(&env) {
             return Err(Error::ContractPaused);
         }
@@ -732,6 +743,9 @@ impl Stellar_CardReceiver {
     /// Panics if called before `init`, if `from.require_auth()` fails, or
     /// with "reentrancy detected" if invoked from inside another guarded call.
     pub fn pay_xlm(env: Env, from: Address, amount: i128, order_id: Bytes) -> Result<(), Error> {
+        if Self::is_decommissioned(&env) {
+            return Err(Error::ContractDecommissioned);
+        }
         if Self::is_paused(&env) {
             return Err(Error::ContractPaused);
         }
@@ -956,6 +970,7 @@ impl Stellar_CardReceiver {
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        Self::require_not_decommissioned(&env);
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
         env.events()
@@ -1019,6 +1034,7 @@ impl Stellar_CardReceiver {
         amount: i128,
     ) -> Result<(), Error> {
         caller.require_auth();
+        Self::require_not_decommissioned(&env);
         if !Self::has_admin_authority(&env, &caller) {
             panic!("rescue_tokens requires the Admin role");
         }
@@ -1124,6 +1140,7 @@ impl Stellar_CardReceiver {
         per_day: Option<i128>,
     ) {
         caller.require_auth();
+        Self::require_not_decommissioned(&env);
         if !Self::has_admin_authority(&env, &caller) {
             panic!("set_withdraw_limits requires the Admin role");
         }
@@ -1282,6 +1299,7 @@ impl Stellar_CardReceiver {
         let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         current_admin.require_auth();
         new_admin.require_auth();
+        Self::require_not_decommissioned(&env);
 
         if current_admin != new_admin
             && Self::get_role(env.clone(), current_admin.clone()) == Some(Role::Admin)
@@ -1332,6 +1350,7 @@ impl Stellar_CardReceiver {
     pub fn grant_role(env: Env, address: Address, role: Role) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        Self::require_not_decommissioned(&env);
 
         Self::store_role(&env, address, role);
     }
@@ -1359,6 +1378,7 @@ impl Stellar_CardReceiver {
     pub fn grant_roles(env: Env, addresses: Vec<Address>, role: Role) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        Self::require_not_decommissioned(&env);
 
         for address in addresses.iter() {
             Self::store_role(&env, address, role);
@@ -1430,6 +1450,7 @@ impl Stellar_CardReceiver {
     pub fn revoke_role(env: Env, address: Address) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        Self::require_not_decommissioned(&env);
 
         // Emit role revoked event (Issue #428 - Part 5)
         Self::remove_role(&env, address, "role_revoked");
@@ -1547,6 +1568,92 @@ impl Stellar_CardReceiver {
             Role::Viewer => 1,
             Role::Operator => 2,
             Role::Admin => 3,
+        }
+    }
+
+    /// Permanently decommissions the contract — the emergency killswitch
+    /// (Issue #671).
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `extra_tokens` - Additional token contracts (beyond the configured
+    ///   USDC and XLM SACs) whose residual balance should also be swept
+    ///
+    /// # Authorization
+    /// Only the stored admin can call this function.
+    ///
+    /// # Effects
+    /// 1. Writes `DataKey::Decommissioned` and `DataKey::Paused`; neither is
+    ///    ever cleared, so the pause becomes irreversible (`unpause` panics).
+    /// 2. Sweeps the contract's full balance of USDC, XLM and every
+    ///    `extra_tokens` entry to the configured treasury. Zero balances are
+    ///    skipped. The sweep runs under the reentrancy guard and ignores
+    ///    `rescue_tokens`'s withdraw limits, since this is a one-time exit.
+    ///
+    /// After this call `pay_usdc`/`pay_xlm` return `ContractDecommissioned`
+    /// and every administrative entrypoint panics.
+    ///
+    /// # Events
+    /// Emits: topics=[Symbol("contract_decommissioned"), admin],
+    /// value=ledger timestamp
+    ///
+    /// # Panics
+    /// Panics if called before `init`, if `admin.require_auth()` fails, if
+    /// the contract is already decommissioned, or if a sweep transfer fails.
+    pub fn decommission(env: Env, extra_tokens: Vec<Address>) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        Self::require_not_decommissioned(&env);
+
+        // Effects before interactions: lock the contract first so a token
+        // callback during the sweep can't reach any live entrypoint.
+        env.storage().instance().set(&DataKey::Decommissioned, &true);
+        env.storage().instance().set(&DataKey::Paused, &true);
+        Self::extend_instance_ttl(&env);
+
+        let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+        let mut tokens: Vec<Address> = Vec::new(&env);
+        tokens.push_back(env.storage().instance().get(&DataKey::UsdcContract).unwrap());
+        tokens.push_back(env.storage().instance().get(&DataKey::XlmContract).unwrap());
+        for token_contract in extra_tokens.iter() {
+            if !tokens.contains(&token_contract) {
+                tokens.push_back(token_contract);
+            }
+        }
+
+        let contract_address = env.current_contract_address();
+        Self::with_reentrancy_guard(&env, || {
+            for token_contract in tokens.iter() {
+                let client = token::Client::new(&env, &token_contract);
+                let balance = client.balance(&contract_address);
+                if balance > 0 {
+                    client.transfer(&contract_address, &treasury, &balance);
+                }
+            }
+        });
+
+        env.events().publish(
+            (Symbol::new(&env, "contract_decommissioned"), admin),
+            env.ledger().timestamp(),
+        );
+    }
+
+    /// Returns whether the contract has been permanently decommissioned.
+    pub fn is_decommissioned_view(env: Env) -> bool {
+        Self::is_decommissioned(&env)
+    }
+
+    fn is_decommissioned(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Decommissioned)
+            .unwrap_or(false)
+    }
+
+    /// Panics once `decommission` has run, locking out every admin action.
+    fn require_not_decommissioned(env: &Env) {
+        if Self::is_decommissioned(env) {
+            panic!("contract is decommissioned");
         }
     }
 
@@ -6587,6 +6694,105 @@ mod test {
         assert_eq!(INSTANCE_TTL_THRESHOLD * 2, INSTANCE_TTL_MAX);
     }
 
+    // ── decommission tests (Issue #671) ───────────────────────────────────────
+
+    fn decommissioned_fixture() -> Fixture {
+        let f = Fixture::new();
+        f.init();
+        f.client().decommission(&Vec::new(&f.env));
+        f
+    }
+
+    #[test]
+    fn test_decommission_sets_permanent_pause_and_sweeps_balances() {
+        let f = Fixture::new();
+        f.init();
+        f.mint_usdc(&f.contract_id, 500);
+        f.mint_xlm(&f.contract_id, 300);
+
+        f.client().decommission(&Vec::new(&f.env));
+
+        assert!(f.client().is_decommissioned_view());
+        assert!(f.client().is_paused_view());
+        assert_eq!(f.usdc_balance(&f.contract_id), 0);
+        assert_eq!(f.xlm_balance(&f.contract_id), 0);
+        assert_eq!(f.usdc_balance(&f.treasury), 500);
+        assert_eq!(f.xlm_balance(&f.treasury), 300);
+        assert_eq!(
+            contract_event_count(&f.env, &f.contract_id, "contract_decommissioned"),
+            1
+        );
+    }
+
+    #[test]
+    fn test_decommission_sweeps_extra_tokens() {
+        let f = Fixture::new();
+        f.init();
+        let other = f
+            .env
+            .register_stellar_asset_contract_v2(f.admin.clone())
+            .address();
+        token::StellarAssetClient::new(&f.env, &other).mint(&f.contract_id, &42);
+
+        let mut extra = Vec::new(&f.env);
+        extra.push_back(other.clone());
+        f.client().decommission(&extra);
+
+        let other_client = token::Client::new(&f.env, &other);
+        assert_eq!(other_client.balance(&f.contract_id), 0);
+        assert_eq!(other_client.balance(&f.treasury), 42);
+    }
+
+    #[test]
+    fn test_payments_rejected_after_decommission() {
+        let f = decommissioned_fixture();
+        f.mint_usdc(&f.payer, 100);
+        f.mint_xlm(&f.payer, 100);
+        let order = order_bytes(&f.env, "order-1");
+        assert_eq!(
+            f.client().try_pay_usdc(&f.payer, &10, &order),
+            Err(Ok(Error::ContractDecommissioned))
+        );
+        assert_eq!(
+            f.client().try_pay_xlm(&f.payer, &10, &order),
+            Err(Ok(Error::ContractDecommissioned))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "contract is decommissioned")]
+    fn test_unpause_locked_after_decommission() {
+        decommissioned_fixture().client().unpause();
+    }
+
+    #[test]
+    #[should_panic(expected = "contract is decommissioned")]
+    fn test_decommission_cannot_run_twice() {
+        let f = decommissioned_fixture();
+        f.client().decommission(&Vec::new(&f.env));
+    }
+
+    #[test]
+    fn test_admin_functions_locked_after_decommission() {
+        let f = decommissioned_fixture();
+        let other = Address::generate(&f.env);
+        let c = f.client();
+        assert!(c.try_pause(&f.admin).is_err());
+        assert!(c.try_upgrade(&BytesN::from_array(&f.env, &[0u8; 32])).is_err());
+        assert!(c
+            .try_rescue_tokens(&f.admin, &f.usdc, &other, &1)
+            .is_err());
+        assert!(c.try_set_withdraw_limits(&f.admin, &None, &None).is_err());
+        assert!(c.try_transfer_admin(&other).is_err());
+        assert!(c.try_grant_role(&other, &Role::Operator).is_err());
+        assert!(c.try_revoke_role(&other).is_err());
+        assert!(c.is_decommissioned_view());
+        assert!(c.is_paused_view());
+    }
+
+    #[test]
+    fn test_contract_decommissioned_error_code() {
+        assert_eq!(Error::ContractDecommissioned as u32, 7);
     // ── Discount tier tests (Issue #657) ──────────────────────────────────────
 
     #[test]
