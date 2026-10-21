@@ -800,6 +800,8 @@ export async function submitSignedTransaction(
     feeRefunded: result.feeRefunded ?? '0',
     maxFee: result.maxFee ?? String(tx.fee ?? BASE_FEE),
   };
+}
+
 // ── Transaction memo builder (#739) ──────────────────────────────────────────
 
 /** Supported {@link buildTransactionMemo} memo types. */
