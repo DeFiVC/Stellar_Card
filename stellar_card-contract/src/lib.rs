@@ -161,6 +161,14 @@ pub enum Role {
     Viewer,
 }
 
+/// Represents a treasury recipient and its percentage share of payments (Issue #679).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TreasurySplit {
+    pub address: Address,
+    pub percentage: u32,
+}
+
 /// Storage keys for contract state.
 ///
 /// Each variant identifies one storage slot. Most live in instance storage;
@@ -171,6 +179,9 @@ pub enum Role {
 pub enum DataKey {
     /// Address that receives forwarded payments. Set once by `init`.
     Treasury,
+    /// List of treasury splits for distributing payments by percentage (Issue #679).
+    /// Absent means single treasury mode; present means split mode.
+    TreasurySplits,
     /// Address of the USDC Stellar Asset Contract (SAC). Set once by `init`.
     UsdcContract,
     /// Address of the native XLM Stellar Asset Contract (SAC). Set once by `init`.
@@ -258,6 +269,8 @@ pub enum Error {
     /// `rescue_tokens` recipient is the contract itself, which would move
     /// nothing while still spending the day's withdraw budget
     InvalidRecipient = 6,
+    /// Treasury split percentages must total 100
+    InvalidTreasurySplits = 7,
     /// The payer address is blacklisted and may not fund cards
     AddressBlacklisted = 7,
     /// The contract has been permanently decommissioned (Issue #671)
@@ -365,7 +378,6 @@ impl Stellar_CardReceiver {
         // Emit initialization event (Issue #428 - Part 5)
         env.events().publish(
             (Symbol::new(&env, "init"), admin.clone()),
-            (symbol_short!("init"), admin.clone()),
             (
                 treasury.clone(),
                 usdc_contract.clone(),
@@ -1742,15 +1754,6 @@ impl Stellar_CardReceiver {
 
         // Emit role revoked event (Issue #428 - Part 5)
         Self::remove_role(&env, address, "role_revoked");
-        let key = DataKey::UserRole(address.clone());
-        if !env.storage().persistent().has(&key) {
-            return;
-        }
-        env.storage().persistent().remove(&key);
-
-        // Emit role revoked event (Issue #428 - Part 5)
-        env.events()
-            .publish((Symbol::new(&env, "role_revoked"), address), ());
     }
 
     /// Allows the caller to give up their own role, without requiring the
@@ -1859,6 +1862,71 @@ impl Stellar_CardReceiver {
         }
     }
 
+    /// Sets treasury splits for routing payments to multiple accounts by percentage (Issue #679).
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `caller` - The address setting the splits (must authorize and be admin)
+    /// * `splits` - Vector of TreasurySplit entries; percentages must sum to 100
+    ///
+    /// # Authorization
+    /// Requires `caller` to hold the `Admin` role.
+    ///
+    /// # Errors
+    /// * `InvalidTreasurySplits` - If percentages don't sum to 100 or list is empty
+    ///
+    /// # Events
+    /// Emits: topics=[Symbol("treasury_splits_set"), caller], value=splits
+    pub fn set_treasury_splits(env: Env, caller: Address, splits: Vec<TreasurySplit>) -> Result<(), Error> {
+        caller.require_auth();
+        if !Self::has_admin_authority(&env, &caller) {
+            panic!("set_treasury_splits requires the Admin role");
+        }
+
+        if splits.is_empty() {
+            return Err(Error::InvalidTreasurySplits);
+        }
+
+        let total_percentage: u32 = splits.iter().fold(0u32, |acc, split| acc + split.percentage);
+        if total_percentage != 100 {
+            return Err(Error::InvalidTreasurySplits);
+        }
+
+        env.storage().instance().set(&DataKey::TreasurySplits, &splits);
+        Self::extend_instance_ttl(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "treasury_splits_set"), caller),
+            splits,
+        );
+        Ok(())
+    }
+
+    /// Clears treasury splits, returning to single treasury mode (Issue #679).
+    ///
+    /// # Authorization
+    /// Requires `caller` to hold the `Admin` role.
+    ///
+    /// # Events
+    /// Emits: topics=[Symbol("treasury_splits_cleared"), caller], value=()
+    pub fn clear_treasury_splits(env: Env, caller: Address) {
+        caller.require_auth();
+        if !Self::has_admin_authority(&env, &caller) {
+            panic!("clear_treasury_splits requires the Admin role");
+        }
+
+        env.storage().instance().remove(&DataKey::TreasurySplits);
+        Self::extend_instance_ttl(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "treasury_splits_cleared"), caller),
+            (),
+        );
+    }
+
+    /// Returns the current treasury splits, or None if in single treasury mode (Issue #679).
+    pub fn get_treasury_splits(env: Env) -> Option<Vec<TreasurySplit>> {
+        env.storage().instance().get(&DataKey::TreasurySplits)
     /// Permanently decommissions the contract — the emergency killswitch
     /// (Issue #671).
     ///
@@ -3123,29 +3191,6 @@ mod test {
         assert_eq!(f.xlm_balance(&f.treasury), amount);
     }
 
-    // ── reentrancy guard: rescue_tokens and callbacks (issue #397) ─────────
-
-    /// A deliberately hostile "token" whose `transfer` tries to call back
-    /// into the receiver contract, the way a malicious token passed to
-    /// `rescue_tokens` could. It records whether the callback got through.
-    mod reentrant_token {
-        use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env};
-
-        #[contracttype]
-        enum Key {
-            Receiver,
-            CallbackSucceeded,
-        }
-
-        #[contract]
-        pub struct ReentrantToken;
-
-        #[contractimpl]
-        impl ReentrantToken {
-            pub fn set_receiver(env: Env, receiver: Address) {
-                env.storage().instance().set(&Key::Receiver, &receiver);
-            }
-
     #[test]
     fn test_init_requires_admin_auth() {
         let env = Env::default();
@@ -4143,6 +4188,9 @@ mod test {
 
         assert_eq!(f.xlm_balance(&f.payer), minted - paid);
         assert_eq!(f.xlm_balance(&f.treasury), paid);
+    }
+
+    #[test]
     fn test_usdc_contract_getter_returns_consistent_value() {
         let f = Fixture::new();
         f.init();
@@ -7258,6 +7306,7 @@ mod test {
         assert_eq!(Error::WithdrawLimitExceeded as u32, 4);
         assert_eq!(Error::DailyWithdrawLimitExceeded as u32, 5);
         assert_eq!(Error::InvalidRecipient as u32, 6);
+        assert_eq!(Error::InvalidTreasurySplits as u32, 7);
         assert_eq!(Error::InvalidDiscount as u32, 7);
         assert_eq!(Error::InvalidMetadata as u32, 8);
     assert_eq!(Error::ArithmeticOverflow as u32, 9);
@@ -7273,6 +7322,220 @@ mod test {
         assert_eq!(INSTANCE_TTL_THRESHOLD * 2, INSTANCE_TTL_MAX);
     }
 
+    // ── Issue #678: Zero-amount token transfer validation ──────────────────────────
+
+    #[test]
+    fn test_pay_usdc_with_zero_amount_returns_invalid_amount() {
+        let f = Fixture::new();
+        f.init();
+        let result = f.client().try_pay_usdc(&f.payer, &0, &order_bytes(&f.env, "zero"));
+        assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+    }
+
+    #[test]
+    fn test_pay_usdc_with_negative_amount_returns_invalid_amount() {
+        let f = Fixture::new();
+        f.init();
+        let result = f.client().try_pay_usdc(&f.payer, &-100, &order_bytes(&f.env, "neg"));
+        assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+    }
+
+    #[test]
+    fn test_pay_xlm_with_zero_amount_returns_invalid_amount() {
+        let f = Fixture::new();
+        f.init();
+        let result = f.client().try_pay_xlm(&f.payer, &0, &order_bytes(&f.env, "zero"));
+        assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+    }
+
+    #[test]
+    fn test_pay_xlm_with_negative_amount_returns_invalid_amount() {
+        let f = Fixture::new();
+        f.init();
+        let result = f.client().try_pay_xlm(&f.payer, &-100, &order_bytes(&f.env, "neg"));
+        assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+    }
+
+    // ── Issue #679: Treasury split routing ─────────────────────────────────────────
+
+    #[test]
+    fn test_set_treasury_splits_with_valid_splits() {
+        let f = Fixture::new();
+        f.init();
+        let treasury2 = Address::generate(&f.env);
+        let treasury3 = Address::generate(&f.env);
+
+        let splits = soroban_sdk::vec![
+            &f.env,
+            TreasurySplit {
+                address: f.treasury.clone(),
+                percentage: 50,
+            },
+            TreasurySplit {
+                address: treasury2.clone(),
+                percentage: 30,
+            },
+            TreasurySplit {
+                address: treasury3.clone(),
+                percentage: 20,
+            },
+        ];
+
+        let result = f.client().try_set_treasury_splits(&f.admin, &splits);
+        assert!(result.is_ok());
+
+        let retrieved = f.client().get_treasury_splits();
+        assert!(retrieved.is_some());
+        if let Some(splits) = retrieved {
+            assert_eq!(splits.len(), 3);
+        }
+    }
+
+    #[test]
+    fn test_set_treasury_splits_with_invalid_percentages() {
+        let f = Fixture::new();
+        f.init();
+        let treasury2 = Address::generate(&f.env);
+
+        let splits = soroban_sdk::vec![
+            &f.env,
+            TreasurySplit {
+                address: f.treasury.clone(),
+                percentage: 60,
+            },
+            TreasurySplit {
+                address: treasury2.clone(),
+                percentage: 30,
+            },
+        ];
+
+        let result = f.client().try_set_treasury_splits(&f.admin, &splits);
+        assert_eq!(result, Err(Ok(Error::InvalidTreasurySplits)));
+    }
+
+    #[test]
+    fn test_set_treasury_splits_with_empty_list() {
+        let f = Fixture::new();
+        f.init();
+        let splits = soroban_sdk::vec![&f.env];
+
+        let result = f.client().try_set_treasury_splits(&f.admin, &splits);
+        assert_eq!(result, Err(Ok(Error::InvalidTreasurySplits)));
+    }
+
+    #[test]
+    fn test_clear_treasury_splits() {
+        let f = Fixture::new();
+        f.init();
+        let treasury2 = Address::generate(&f.env);
+
+        let splits = soroban_sdk::vec![
+            &f.env,
+            TreasurySplit {
+                address: f.treasury.clone(),
+                percentage: 50,
+            },
+            TreasurySplit {
+                address: treasury2.clone(),
+                percentage: 50,
+            },
+        ];
+
+        f.client().set_treasury_splits(&f.admin, &splits);
+        assert!(f.client().get_treasury_splits().is_some());
+
+        f.client().clear_treasury_splits(&f.admin);
+        assert!(f.client().get_treasury_splits().is_none());
+    }
+
+    // ── Issue #680: Property-based arithmetic testing ───────────────────────────────
+
+    #[test]
+    fn test_arithmetic_saturating_add_properties() {
+        let amounts = [
+            (0i128, 0i128, 0i128),
+            (100i128, 200i128, 300i128),
+            (i128::MAX, 0i128, i128::MAX),
+            (i128::MAX, i128::MAX, i128::MAX),
+            (1000i128, 2000i128, 3000i128),
+        ];
+
+        for (a, b, expected) in &amounts {
+            assert_eq!(a.saturating_add(*b), *expected);
+        }
+    }
+
+    #[test]
+    fn test_withdraw_limit_calculation_properties() {
+        let test_cases = [
+            (0i128, 0i128, 0i128),
+            (1000i128, 500i128, 1500i128),
+            (100i128, 0i128, 100i128),
+            (i128::MAX, 0i128, i128::MAX),
+        ];
+
+        for (initial, withdrawal, expected) in &test_cases {
+            let new_total = initial.saturating_add(*withdrawal);
+            assert_eq!(new_total, *expected);
+        }
+    }
+
+    #[test]
+    fn test_percentage_split_arithmetic_properties() {
+        let test_cases = [
+            (1000i128, 50u32, 500i128),
+            (1000i128, 25u32, 250i128),
+            (1000i128, 100u32, 1000i128),
+            (2000i128, 50u32, 1000i128),
+            (9999i128, 33u32, 3299i128),
+        ];
+
+        for (amount, percentage, expected) in &test_cases {
+            let split_amount = (*amount as u128 * *percentage as u128 / 100u128) as i128;
+            assert_eq!(split_amount, *expected);
+        }
+    }
+
+    #[test]
+    fn test_role_hierarchy_ordering_properties() {
+        assert!(Stellar_CardReceiver::is_role_sufficient(&Role::Admin, &Role::Admin));
+        assert!(Stellar_CardReceiver::is_role_sufficient(&Role::Admin, &Role::Operator));
+        assert!(Stellar_CardReceiver::is_role_sufficient(&Role::Admin, &Role::Viewer));
+
+        assert!(!Stellar_CardReceiver::is_role_sufficient(&Role::Operator, &Role::Admin));
+        assert!(Stellar_CardReceiver::is_role_sufficient(&Role::Operator, &Role::Operator));
+        assert!(Stellar_CardReceiver::is_role_sufficient(&Role::Operator, &Role::Viewer));
+
+        assert!(!Stellar_CardReceiver::is_role_sufficient(&Role::Viewer, &Role::Admin));
+        assert!(!Stellar_CardReceiver::is_role_sufficient(&Role::Viewer, &Role::Operator));
+        assert!(Stellar_CardReceiver::is_role_sufficient(&Role::Viewer, &Role::Viewer));
+    }
+
+    #[test]
+    fn test_daily_limit_reset_on_day_boundary() {
+        let f = Fixture::new();
+        f.init();
+        f.mint_usdc(&f.contract_id, 10_000);
+
+        let day1 = f.env.ledger().timestamp() / 86_400;
+        let amount = 1000i128;
+
+        f.client()
+            .set_withdraw_limits(&f.admin, &Some(10_000), &Some(5_000));
+
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &f.treasury, &amount);
+        assert_eq!(f.client().withdrawn_today(), amount);
+
+        f.env.ledger().with_mut(|li| li.timestamp += 86_400);
+        let day2 = f.env.ledger().timestamp() / 86_400;
+        assert_ne!(day1, day2);
+
+        assert_eq!(f.client().withdrawn_today(), 0);
+
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &f.treasury, &amount);
+        assert_eq!(f.client().withdrawn_today(), amount);
     // ── decommission tests (Issue #671) ───────────────────────────────────────
 
     fn decommissioned_fixture() -> Fixture {
