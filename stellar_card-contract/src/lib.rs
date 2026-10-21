@@ -4312,6 +4312,244 @@ mod test {
         assert_eq!(f.client().get_role(&user3), Some(Role::Viewer));
     }
 
+    // ── unauthorized caller edge cases (issue #652) ─────────────────────────
+
+    /// Grants `role` to `addr` and returns it, for the negative-auth suite.
+    fn fixture_with_role(f: &Fixture, role: Role) -> Address {
+        let addr = Address::generate(&f.env);
+        f.client().grant_role(&addr, &role);
+        addr
+    }
+
+    // -- no signature at all: Soroban auth must reject the call --
+
+    #[test]
+    #[should_panic]
+    fn test_no_auth_caller_cannot_pause() {
+        let f = Fixture::new();
+        f.init();
+        let c = f.client().mock_auths(&[]);
+        c.pause(&f.admin);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_no_auth_caller_cannot_unpause() {
+        let f = Fixture::new();
+        f.init();
+        f.client().pause(&f.admin);
+        let c = f.client().mock_auths(&[]);
+        c.unpause();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_no_auth_caller_cannot_upgrade() {
+        let f = Fixture::new();
+        f.init();
+        let c = f.client().mock_auths(&[]);
+        c.upgrade(&BytesN::from_array(&f.env, &[0u8; 32]));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_no_auth_caller_cannot_grant_role() {
+        let f = Fixture::new();
+        f.init();
+        let target = Address::generate(&f.env);
+        let c = f.client().mock_auths(&[]);
+        c.grant_role(&target, &Role::Viewer);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_no_auth_caller_cannot_revoke_role() {
+        let f = Fixture::new();
+        f.init();
+        let target = fixture_with_role(&f, Role::Viewer);
+        let c = f.client().mock_auths(&[]);
+        c.revoke_role(&target);
+    }
+
+    // -- Operator attempting Admin-only actions. The operator signs the
+    //    call (so Soroban auth is not the failing check) but is not the
+    //    stored admin, so the role/authority gate must reject it. --
+
+    #[test]
+    #[should_panic]
+    fn test_operator_cannot_upgrade() {
+        let f = Fixture::new();
+        f.init();
+        let operator = fixture_with_role(&f, Role::Operator);
+        let hash = BytesN::from_array(&f.env, &[1u8; 32]);
+        f.env.mock_auths(&[MockAuth {
+            address: &operator,
+            invoke: &MockAuthInvoke {
+                contract: &f.contract_id,
+                fn_name: "upgrade",
+                args: (hash.clone(),).into_val(&f.env),
+                sub_invokes: &[],
+            },
+        }]);
+        f.client().upgrade(&hash);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_operator_cannot_grant_role() {
+        let f = Fixture::new();
+        f.init();
+        let operator = fixture_with_role(&f, Role::Operator);
+        let target = Address::generate(&f.env);
+        f.env.mock_auths(&[MockAuth {
+            address: &operator,
+            invoke: &MockAuthInvoke {
+                contract: &f.contract_id,
+                fn_name: "grant_role",
+                args: (target.clone(), Role::Admin).into_val(&f.env),
+                sub_invokes: &[],
+            },
+        }]);
+        f.client().grant_role(&target, &Role::Admin);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_operator_cannot_revoke_role() {
+        let f = Fixture::new();
+        f.init();
+        let operator = fixture_with_role(&f, Role::Operator);
+        let target = fixture_with_role(&f, Role::Viewer);
+        f.env.mock_auths(&[MockAuth {
+            address: &operator,
+            invoke: &MockAuthInvoke {
+                contract: &f.contract_id,
+                fn_name: "revoke_role",
+                args: (target.clone(),).into_val(&f.env),
+                sub_invokes: &[],
+            },
+        }]);
+        f.client().revoke_role(&target);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_operator_cannot_unpause() {
+        let f = Fixture::new();
+        f.init();
+        let operator = fixture_with_role(&f, Role::Operator);
+        f.client().pause(&f.admin);
+        f.env.mock_auths(&[MockAuth {
+            address: &operator,
+            invoke: &MockAuthInvoke {
+                contract: &f.contract_id,
+                fn_name: "unpause",
+                args: ().into_val(&f.env),
+                sub_invokes: &[],
+            },
+        }]);
+        f.client().unpause();
+    }
+
+    #[test]
+    #[should_panic(expected = "rescue_tokens requires the Admin role")]
+    fn test_operator_cannot_rescue_tokens() {
+        let f = Fixture::new();
+        f.init();
+        let operator = fixture_with_role(&f, Role::Operator);
+        let other = Address::generate(&f.env);
+        f.mint_usdc(&f.contract_id, 100);
+        f.client().rescue_tokens(&operator, &f.usdc, &other, &1);
+    }
+
+    #[test]
+    #[should_panic(expected = "set_withdraw_limits requires the Admin role")]
+    fn test_operator_cannot_set_withdraw_limits() {
+        let f = Fixture::new();
+        f.init();
+        let operator = fixture_with_role(&f, Role::Operator);
+        f.client()
+            .set_withdraw_limits(&operator, &Some(10), &Some(20));
+    }
+
+    // -- Viewer attempting Operator-only actions --
+
+    #[test]
+    #[should_panic(expected = "pause requires at least the Operator role")]
+    fn test_viewer_cannot_pause() {
+        let f = Fixture::new();
+        f.init();
+        let viewer = fixture_with_role(&f, Role::Viewer);
+        f.client().pause(&viewer);
+    }
+
+    #[test]
+    #[should_panic(expected = "set_discount requires at least the Operator role")]
+    fn test_viewer_cannot_set_discount() {
+        let f = Fixture::new();
+        f.init();
+        let viewer = fixture_with_role(&f, Role::Viewer);
+        let account = Address::generate(&f.env);
+        f.client().set_discount(&viewer, &account, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "set_blacklisted requires at least the Operator role")]
+    fn test_viewer_cannot_set_blacklisted_via_role_check() {
+        let f = Fixture::new();
+        f.init();
+        let viewer = fixture_with_role(&f, Role::Viewer);
+        let account = Address::generate(&f.env);
+        f.client().set_blacklisted(&viewer, &account, &true);
+    }
+
+    #[test]
+    #[should_panic(expected = "rescue_tokens requires the Admin role")]
+    fn test_viewer_cannot_rescue_tokens() {
+        let f = Fixture::new();
+        f.init();
+        let viewer = fixture_with_role(&f, Role::Viewer);
+        let other = Address::generate(&f.env);
+        f.mint_usdc(&f.contract_id, 100);
+        f.client().rescue_tokens(&viewer, &f.usdc, &other, &1);
+    }
+
+    // -- no-role address attempting Operator and Admin actions --
+
+    #[test]
+    #[should_panic(expected = "set_discount requires at least the Operator role")]
+    fn test_no_role_cannot_set_discount() {
+        let f = Fixture::new();
+        f.init();
+        let stranger = Address::generate(&f.env);
+        let account = Address::generate(&f.env);
+        f.client().set_discount(&stranger, &account, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "rescue_tokens requires the Admin role")]
+    fn test_no_role_cannot_rescue_tokens() {
+        let f = Fixture::new();
+        f.init();
+        let stranger = Address::generate(&f.env);
+        let other = Address::generate(&f.env);
+        f.mint_usdc(&f.contract_id, 100);
+        f.client().rescue_tokens(&stranger, &f.usdc, &other, &1);
+    }
+
+    // -- role holders still cannot cross into the tier above --
+
+    #[test]
+    fn test_viewer_still_reads_after_denied_write() {
+        let f = Fixture::new();
+        f.init();
+        let viewer = fixture_with_role(&f, Role::Viewer);
+        // Reads stay open after a denied privileged attempt.
+        assert!(f.client().is_paused_view() == false);
+        assert_eq!(f.client().get_role(&viewer), Some(Role::Viewer));
+        assert_eq!(f.client().get_config().admin, f.admin);
+    }
+
     // ── role management tests ────────────────────────────────────────────────
 
     #[test]
