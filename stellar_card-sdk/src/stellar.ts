@@ -443,6 +443,8 @@ export interface PayOpts {
   networkPassphrase?: string;
   /** Custom Soroban RPC URL. Defaults to the public endpoint for the selected network. */
   sorobanRpcUrl?: string;
+  /** Fallback Soroban RPC URL used when the primary endpoint fails. */
+  fallbackRpcUrl?: string;
   /** Override the Horizon REST API URL. Defaults to the public endpoint for the selected network. */
   horizonUrl?: string;
   /** Optional logger instance */
@@ -492,6 +494,7 @@ export async function payViaContract(opts: PayOpts): Promise<ContractPaymentResu
     paymentAsset = 'usdc',
     networkPassphrase = Networks.PUBLIC,
     sorobanRpcUrl,
+    fallbackRpcUrl,
     horizonUrl,
     logger,
     baseFee,
@@ -518,44 +521,53 @@ export async function payViaContract(opts: PayOpts): Promise<ContractPaymentResu
     { orderId: payment.order_id, contractId: payment.contract_id, fn, amountDecimal },
   );
 
-  // Fee retry: if the network rejects the fee, rebuild with the
-  // required fee as the floor. At most one retry — the network's
-  // suggested fee should be sufficient on the second attempt.
-  let fee: string | undefined;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const { tx, server } = await buildContractPaymentTx({
-      contractId: payment.contract_id,
-      fn,
-      fromPublicKey: keypair.publicKey(),
-      amountStroops,
-      orderId: payment.order_id,
-      networkPassphrase,
-      rpcUrl: sorobanRpcUrl,
-      fee,
-      baseFee,
-    });
-    tx.sign(keypair);
-    try {
-      logger?.debug?.(`Submitting Soroban transaction (attempt ${attempt + 1}) to RPC`);
-      const result = await submitSorobanTx(tx, server, resolvedHorizonUrl, logger);
-      logger?.info?.(`Soroban transaction submitted successfully: ${result.hash}`);
-      return {
-        hash: result.hash,
-        feeCharged: result.feeCharged ?? result.maxFee ?? tx.fee,
-        feeRefunded: result.feeRefunded ?? '0',
-        maxFee: result.maxFee ?? tx.fee,
-      };
-    } catch (err) {
-      if (err instanceof InsufficientFeeError && attempt === 0) {
-        fee = err.requiredFee;
-        logger?.info?.(`Soroban transaction fee insufficient, bumping fee to ${fee} and retrying`);
-        continue;
+  // RPC failover: try the primary endpoint first, then the fallback when it
+  // is configured. Each endpoint gets its own fee-retry pass. When neither
+  // custom URL is given, a single `undefined` entry is used so
+  // `buildContractPaymentTx` resolves the network default.
+  const rpcEndpoints =
+    sorobanRpcUrl || fallbackRpcUrl
+      ? [sorobanRpcUrl, fallbackRpcUrl].filter((url): url is string => Boolean(url))
+      : [undefined];
+  let lastError: unknown;
+  for (const rpcUrl of rpcEndpoints) {
+    let fee: string | undefined;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const { tx, server } = await buildContractPaymentTx({
+        contractId: payment.contract_id,
+        fn,
+        fromPublicKey: keypair.publicKey(),
+        amountStroops,
+        orderId: payment.order_id,
+        networkPassphrase,
+        rpcUrl,
+        fee,
+        baseFee,
+      });
+      tx.sign(keypair);
+      try {
+        logger?.debug?.(`Submitting Soroban transaction (attempt ${attempt + 1}) to RPC`);
+        const result = await submitSorobanTx(tx, server, resolvedHorizonUrl, logger);
+        logger?.info?.(`Soroban transaction submitted successfully: ${result.hash}`);
+        return {
+          hash: result.hash,
+          feeCharged: result.feeCharged ?? result.maxFee ?? tx.fee,
+          feeRefunded: result.feeRefunded ?? '0',
+          maxFee: result.maxFee ?? tx.fee,
+        };
+      } catch (err) {
+        if (err instanceof InsufficientFeeError && attempt === 0) {
+          fee = err.requiredFee;
+          logger?.info?.(`Soroban transaction fee insufficient, bumping fee to ${fee} and retrying`);
+          continue;
+        }
+        lastError = err;
+        logger?.warn?.(`RPC endpoint ${String(rpcUrl) ?? 'default'} failed: ${String(err)}`);
+        break;
       }
-      logger?.error?.(`Soroban transaction submission failed: ${String(err)}`, { error: err });
-      throw err;
     }
   }
-  throw new Error('payViaContract: fee retry exhausted');
+  throw lastError ?? new Error('payViaContract: all RPC endpoints failed');
 }
 
 /**
@@ -594,6 +606,8 @@ export async function purchaseCard(opts: {
   baseUrl?: string;
   networkPassphrase?: string;
   sorobanRpcUrl?: string;
+  /** Fallback Soroban RPC URL used when the primary endpoint fails. */
+  fallbackRpcUrl?: string;
   /** Override the Horizon REST API URL used during contract submission. */
   horizonUrl?: string;
   resume?: { orderId: string; payment: PaymentInstructions };
@@ -626,6 +640,7 @@ export async function purchaseCard(opts: {
     paymentAsset,
     networkPassphrase: opts.networkPassphrase,
     sorobanRpcUrl: opts.sorobanRpcUrl,
+    fallbackRpcUrl: opts.fallbackRpcUrl,
     horizonUrl: opts.horizonUrl,
   });
 

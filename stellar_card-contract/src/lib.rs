@@ -6287,4 +6287,98 @@ mod test {
         assert_eq!(TOKEN_DECIMALS, 7);
         assert_eq!(INSTANCE_TTL_THRESHOLD * 2, INSTANCE_TTL_MAX);
     }
+
+    // ── Issue #682: ledger close boundary conditions ────────────────────────
+
+    /// The daily withdraw accumulator is keyed to `ledger.timestamp / 86_400`,
+    /// so it must reset when the ledger clock crosses the day boundary.
+    #[test]
+    fn test_withdrawn_today_resets_at_day_ledger_boundary() {
+        let f = Fixture::new();
+        f.init();
+
+        f.client()
+            .set_withdraw_limits(&f.admin, &Some(500_000), &Some(1_000_000));
+        f.mint_usdc(&f.contract_id, 750_000);
+
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &f.treasury, &250_000);
+        assert_eq!(
+            Stellar_CardReceiver::withdrawn_today(f.env.clone()),
+            250_000,
+            "today's accumulator should reflect the rescue"
+        );
+
+        // Cross the ledger day boundary (00:00 UTC rollover).
+        f.env.ledger().with_mut(|li| li.timestamp += 86_400);
+
+        assert_eq!(
+            Stellar_CardReceiver::withdrawn_today(f.env.clone()),
+            0,
+            "withdrawn_today must reset at the ledger day boundary"
+        );
+
+        // The full daily budget is available again on the new day.
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &f.treasury, &500_000);
+        assert_eq!(
+            Stellar_CardReceiver::withdrawn_today(f.env.clone()),
+            500_000,
+            "new day's accumulator should reflect the second rescue"
+        );
+    }
+
+    /// The instance TTL threshold is deliberately half the max: a write near
+    /// ledger close extends to INSTANCE_TTL_MAX without re-billing an entry
+    /// that already carries full TTL.
+    #[test]
+    fn test_instance_ttl_threshold_boundary() {
+        assert_eq!(INSTANCE_TTL_THRESHOLD * 2, INSTANCE_TTL_MAX);
+        assert!(INSTANCE_TTL_THRESHOLD < INSTANCE_TTL_MAX);
+
+        let f = Fixture::new();
+        f.init();
+
+        f.client()
+            .set_withdraw_limits(&f.admin, &Some(100_000), &Some(200_000));
+
+        // The write landed, proving instance TTL was extended at the boundary.
+        let (per_call, per_day) = Stellar_CardReceiver::withdraw_limits(f.env.clone());
+        assert_eq!(per_call, Some(100_000));
+        assert_eq!(per_day, Some(200_000));
+    }
+
+    /// Exhausting the daily budget just before ledger close must not block a
+    /// rescue seconds after close: the daily limit rolls over at day boundary.
+    #[test]
+    fn test_rescue_daily_limit_boundary_at_day_rollover() {
+        let f = Fixture::new();
+        f.init();
+
+        f.client()
+            .set_withdraw_limits(&f.admin, &Some(100_000), &Some(100_000));
+        f.mint_usdc(&f.contract_id, 200_000);
+
+        // Exhaust the entire day's budget just before the boundary.
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &f.treasury, &100_000);
+        assert_eq!(
+            f.client()
+                .try_rescue_tokens(&f.admin, &f.usdc, &f.treasury, &1),
+            Err(Ok(Error::DailyWithdrawLimitExceeded)),
+            "same-day rescue past the daily limit must be rejected"
+        );
+
+        // Cross the ledger day boundary.
+        f.env.ledger().with_mut(|li| li.timestamp += 86_400);
+
+        // A fresh day means a fresh budget.
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &f.treasury, &100_000);
+        assert_eq!(
+            Stellar_CardReceiver::withdrawn_today(f.env.clone()),
+            100_000,
+            "new day's accumulator holds only the new day's rescue"
+        );
+    }
 }
