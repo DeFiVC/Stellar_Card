@@ -1,4 +1,6 @@
 export { Stellar_CardClient } from './client';
+export { ReconnectingStreamClient } from './streaming';
+export type { StreamingClientOptions, StreamMessage, ConnectionState } from './streaming';
 export type {
   OrderOptions,
   CreateOrderOptions,
@@ -18,6 +20,8 @@ export type {
   IterateOrdersOptions,
   ReportStatusOptions,
   StellarCardClientOptions,
+  AuditLogEntry,
+  ListAuditLogsOptions,
 } from './client';
 
 export {

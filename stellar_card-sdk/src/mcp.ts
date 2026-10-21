@@ -139,7 +139,10 @@ if (!OWS_WALLET_NAME) {
   process.stderr.write('Warning: OWS_WALLET_NAME is not set. Run setup_wallet for instructions.\n');
 }
 
-const server = new Server(
+// Exported (in addition to startMcpServer) so tests can drive the real
+// request handlers through an in-memory MCP transport + client instead of
+// re-implementing the dispatch logic. See src/__tests__/mcp-validation.test.ts.
+export const server = new Server(
   { name: 'stellar_card', version: PKG_VERSION },
   { capabilities: { tools: {}, resources: { subscribe: true } } },
 );
