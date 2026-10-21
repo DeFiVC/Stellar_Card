@@ -10,8 +10,9 @@ name: SDK Validate (PR)
 #   3. Full test suite
 #   4. Production build (CJS + ESM)
 #   5. Browser-entry safety check (no Node built-ins)
-#   6. Package contents verification
-#   7. npm pack dry-run — asserts the tarball can be created and lists
+#   6. Gzipped bundle size budget via size-limit (#725)
+#   7. Package contents verification
+#   8. npm pack dry-run — asserts the tarball can be created and lists
 #      every file that would be uploaded to the registry
 #
 # Issue: #155 — Setup automated CI/CD for NPM publishing (Part 1)
@@ -79,6 +80,10 @@ jobs:
       - name: Check browser entry has no Node built-ins
         working-directory: stellar_card-sdk
         run: npm run check:browser
+
+      - name: Check gzipped bundle size (#725)
+        working-directory: stellar_card-sdk
+        run: npm run size
 
       - name: Verify publishable package contents
         working-directory: stellar_card-sdk

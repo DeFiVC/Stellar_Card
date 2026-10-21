@@ -50,20 +50,22 @@
 //! each event as a real state transition. The first topic is always the
 //! event name:
 //!
-//! | Event                 | Topics                            | Data                                      |
-//! |-----------------------|-----------------------------------|-------------------------------------------|
-//! | `init`                | `admin`                           | `(treasury, usdc_contract, xlm_contract)` |
-//! | `pay_usdc`            | `order_id`, `from`                | `amount`                                  |
-//! | `pay_xlm`             | `order_id`, `from`                | `amount`                                  |
-//! | `paused`              | `caller`                          | `true`                                    |
-//! | `unpaused`            | `admin`                           | `false`                                   |
-//! | `upgraded`            | `admin`                           | `new_wasm_hash`                           |
-//! | `tokens_rescued`      | `token_contract`, `to`            | `(caller, amount)`                        |
-//! | `withdraw_limits_set` | `caller`                          | `(per_call, per_day)`                     |
-//! | `admin_transferred`   | `old_admin`, `new_admin`          | `()`                                      |
-//! | `role_granted`        | `address`                         | `role`                                    |
-//! | `role_revoked`        | `address`                         | `()`                                      |
-//! | `role_renounced`      | `caller`                          | `()`                                      |
+//! | Event                    | Topics                                        | Data                                      |
+//! |--------------------------|-----------------------------------------------|-------------------------------------------|
+//! | `init`                   | `admin`                                       | `(treasury, usdc_contract, xlm_contract)` |
+//! | `pay_usdc`               | `order_id`, `from`                            | `amount`                                  |
+//! | `pay_xlm`                | `order_id`, `from`                            | `amount`                                  |
+//! | `paused`                 | `caller`                                      | `true`                                    |
+//! | `unpaused`               | `admin`                                       | `false`                                   |
+//! | `upgraded`               | `admin`                                       | `new_wasm_hash`                           |
+//! | `tokens_rescued`         | `token_contract`, `to`                        | `(caller, amount)`                        |
+//! | `withdraw_limits_set`    | `caller`                                      | `(per_call, per_day)`                     |
+//! | `treasury_updated`       | `old_treasury`, `new_treasury`                | `admin`                                   |
+//! | `token_contract_updated` | `asset_symbol`, `old_contract`, `new_contract`| `admin`                                   |
+//! | `admin_transferred`      | `old_admin`, `new_admin`                      | `()`                                      |
+//! | `role_granted`           | `address`                                     | `role`                                    |
+//! | `role_revoked`           | `address`                                     | `()`                                      |
+//! | `role_renounced`         | `caller`                                      | `()`                                      |
 //!
 //! `transfer_admin` also moves the `Admin` role, so it is preceded by a
 //! `role_revoked` for the old admin (when it held `Admin`) and a
@@ -212,6 +214,15 @@ pub enum DataKey {
     /// and the payment path reads one entry instead of deserializing a map
     /// that grows with the list.
     Blacklist(Address),
+    /// Emergency killswitch (Issue #671): set to `true` by `decommission`
+    /// and never cleared. Once present, the contract is permanently paused
+    /// and every payment and administrative entrypoint is locked out.
+    Decommissioned,
+    /// Per-address fee discount in basis points (1 bps = 0.01%). Stored only
+    /// for accounts with an active discount; absence means no discount (0 bps).
+    /// Maximum 10000 bps (100% discount). Persistent storage, per-address key
+    /// following the `UserRole` pattern.
+    Discounts(Address),
 }
 
 /// Errors returned by the fallible (`Result`-returning) entrypoints.
@@ -240,6 +251,10 @@ pub enum Error {
     InvalidRecipient = 6,
     /// The payer address is blacklisted and may not fund cards
     AddressBlacklisted = 7,
+    /// The contract has been permanently decommissioned (Issue #671)
+    ContractDecommissioned = 7,
+    /// Discount value exceeds the maximum allowed (10000 basis points = 100%)
+    InvalidDiscount = 7,
 }
 
 /// The stellar_card card receiver contract.
@@ -616,6 +631,7 @@ impl Stellar_CardReceiver {
     /// `caller.require_auth()` fails.
     pub fn pause(env: Env, caller: Address) {
         caller.require_auth();
+        Self::require_not_decommissioned(&env);
         if !Self::has_authority(&env, &caller, Role::Operator) {
             panic!("pause requires at least the Operator role");
         }
@@ -651,6 +667,7 @@ impl Stellar_CardReceiver {
     pub fn unpause(env: Env) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        Self::require_not_decommissioned(&env);
         if !Self::is_paused(&env) {
             return;
         }
@@ -728,6 +745,9 @@ impl Stellar_CardReceiver {
     /// Panics if called before `init`, if `from.require_auth()` fails, or
     /// with "reentrancy detected" if invoked from inside another guarded call.
     pub fn pay_usdc(env: Env, from: Address, amount: i128, order_id: Bytes) -> Result<(), Error> {
+        if Self::is_decommissioned(&env) {
+            return Err(Error::ContractDecommissioned);
+        }
         if Self::is_paused(&env) {
             return Err(Error::ContractPaused);
         }
@@ -746,11 +766,14 @@ impl Stellar_CardReceiver {
             .get(&DataKey::UsdcContract)
             .unwrap();
 
+        // Apply discount if the payer has one
+        let net_amount = Self::apply_discount(&env, &from, amount);
+
         // The token contract is the only external call in this function, so
         // it is the only step that needs to run under the guard.
         let transferred = Self::with_reentrancy_guard(&env, || {
             token::Client::new(&env, &usdc_contract)
-                .try_transfer(&from, &treasury, &amount)
+                .try_transfer(&from, &treasury, &net_amount)
                 .is_ok()
         });
         if !transferred {
@@ -793,6 +816,9 @@ impl Stellar_CardReceiver {
     /// Panics if called before `init`, if `from.require_auth()` fails, or
     /// with "reentrancy detected" if invoked from inside another guarded call.
     pub fn pay_xlm(env: Env, from: Address, amount: i128, order_id: Bytes) -> Result<(), Error> {
+        if Self::is_decommissioned(&env) {
+            return Err(Error::ContractDecommissioned);
+        }
         if Self::is_paused(&env) {
             return Err(Error::ContractPaused);
         }
@@ -807,11 +833,14 @@ impl Stellar_CardReceiver {
         let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
         let xlm_contract: Address = env.storage().instance().get(&DataKey::XlmContract).unwrap();
 
+        // Apply discount if the payer has one
+        let net_amount = Self::apply_discount(&env, &from, amount);
+
         // The token contract is the only external call in this function, so
         // it is the only step that needs to run under the guard.
         let transferred = Self::with_reentrancy_guard(&env, || {
             token::Client::new(&env, &xlm_contract)
-                .try_transfer(&from, &treasury, &amount)
+                .try_transfer(&from, &treasury, &net_amount)
                 .is_ok()
         });
         if !transferred {
@@ -897,6 +926,107 @@ impl Stellar_CardReceiver {
         Self::is_paused(&env)
     }
 
+    /// Updates the treasury address.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `new_treasury` - The new treasury address
+    ///
+    /// # Authorization
+    /// Only the admin can call this function.
+    ///
+    /// # Events
+    /// Emits: topics=[Symbol("treasury_updated"), old_treasury, new_treasury], value=admin
+    ///
+    /// # Panics
+    /// Panics if called before `init` or if `admin.require_auth()` fails.
+    pub fn update_treasury(env: Env, new_treasury: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let old_treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+        env.storage().instance().set(&DataKey::Treasury, &new_treasury);
+        Self::extend_instance_ttl(&env);
+
+        // Emit treasury update event
+        env.events().publish(
+            (
+                Symbol::new(&env, "treasury_updated"),
+                old_treasury,
+                new_treasury,
+            ),
+            admin,
+        );
+    }
+
+    /// Updates the USDC token contract address.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `new_contract` - The new USDC contract address
+    ///
+    /// # Authorization
+    /// Only the admin can call this function.
+    ///
+    /// # Events
+    /// Emits: topics=[Symbol("token_contract_updated"), Symbol("USDC"), old_contract, new_contract], value=admin
+    ///
+    /// # Panics
+    /// Panics if called before `init` or if `admin.require_auth()` fails.
+    pub fn update_usdc_contract(env: Env, new_contract: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let old_contract: Address = env.storage().instance().get(&DataKey::UsdcContract).unwrap();
+        env.storage().instance().set(&DataKey::UsdcContract, &new_contract);
+        Self::extend_instance_ttl(&env);
+
+        // Emit token contract update event
+        env.events().publish(
+            (
+                Symbol::new(&env, "token_contract_updated"),
+                symbol_short!("USDC"),
+                old_contract,
+                new_contract,
+            ),
+            admin,
+        );
+    }
+
+    /// Updates the XLM token contract address.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `new_contract` - The new XLM contract address
+    ///
+    /// # Authorization
+    /// Only the admin can call this function.
+    ///
+    /// # Events
+    /// Emits: topics=[Symbol("token_contract_updated"), Symbol("XLM"), old_contract, new_contract], value=admin
+    ///
+    /// # Panics
+    /// Panics if called before `init` or if `admin.require_auth()` fails.
+    pub fn update_xlm_contract(env: Env, new_contract: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let old_contract: Address = env.storage().instance().get(&DataKey::XlmContract).unwrap();
+        env.storage().instance().set(&DataKey::XlmContract, &new_contract);
+        Self::extend_instance_ttl(&env);
+
+        // Emit token contract update event
+        env.events().publish(
+            (
+                Symbol::new(&env, "token_contract_updated"),
+                symbol_short!("XLM"),
+                old_contract,
+                new_contract,
+            ),
+            admin,
+        );
+    }
+
     /// Upgrades the contract WASM code.
     ///
     /// # Arguments
@@ -916,6 +1046,7 @@ impl Stellar_CardReceiver {
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        Self::require_not_decommissioned(&env);
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
         env.events()
@@ -979,6 +1110,7 @@ impl Stellar_CardReceiver {
         amount: i128,
     ) -> Result<(), Error> {
         caller.require_auth();
+        Self::require_not_decommissioned(&env);
         if !Self::has_admin_authority(&env, &caller) {
             panic!("rescue_tokens requires the Admin role");
         }
@@ -1084,6 +1216,7 @@ impl Stellar_CardReceiver {
         per_day: Option<i128>,
     ) {
         caller.require_auth();
+        Self::require_not_decommissioned(&env);
         if !Self::has_admin_authority(&env, &caller) {
             panic!("set_withdraw_limits requires the Admin role");
         }
@@ -1242,6 +1375,7 @@ impl Stellar_CardReceiver {
         let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         current_admin.require_auth();
         new_admin.require_auth();
+        Self::require_not_decommissioned(&env);
 
         if current_admin != new_admin
             && Self::get_role(env.clone(), current_admin.clone()) == Some(Role::Admin)
@@ -1292,6 +1426,7 @@ impl Stellar_CardReceiver {
     pub fn grant_role(env: Env, address: Address, role: Role) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        Self::require_not_decommissioned(&env);
 
         Self::store_role(&env, address, role);
     }
@@ -1319,6 +1454,7 @@ impl Stellar_CardReceiver {
     pub fn grant_roles(env: Env, addresses: Vec<Address>, role: Role) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        Self::require_not_decommissioned(&env);
 
         for address in addresses.iter() {
             Self::store_role(&env, address, role);
@@ -1390,6 +1526,7 @@ impl Stellar_CardReceiver {
     pub fn revoke_role(env: Env, address: Address) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        Self::require_not_decommissioned(&env);
 
         // Emit role revoked event (Issue #428 - Part 5)
         Self::remove_role(&env, address, "role_revoked");
@@ -1510,6 +1647,92 @@ impl Stellar_CardReceiver {
         }
     }
 
+    /// Permanently decommissions the contract — the emergency killswitch
+    /// (Issue #671).
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `extra_tokens` - Additional token contracts (beyond the configured
+    ///   USDC and XLM SACs) whose residual balance should also be swept
+    ///
+    /// # Authorization
+    /// Only the stored admin can call this function.
+    ///
+    /// # Effects
+    /// 1. Writes `DataKey::Decommissioned` and `DataKey::Paused`; neither is
+    ///    ever cleared, so the pause becomes irreversible (`unpause` panics).
+    /// 2. Sweeps the contract's full balance of USDC, XLM and every
+    ///    `extra_tokens` entry to the configured treasury. Zero balances are
+    ///    skipped. The sweep runs under the reentrancy guard and ignores
+    ///    `rescue_tokens`'s withdraw limits, since this is a one-time exit.
+    ///
+    /// After this call `pay_usdc`/`pay_xlm` return `ContractDecommissioned`
+    /// and every administrative entrypoint panics.
+    ///
+    /// # Events
+    /// Emits: topics=[Symbol("contract_decommissioned"), admin],
+    /// value=ledger timestamp
+    ///
+    /// # Panics
+    /// Panics if called before `init`, if `admin.require_auth()` fails, if
+    /// the contract is already decommissioned, or if a sweep transfer fails.
+    pub fn decommission(env: Env, extra_tokens: Vec<Address>) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        Self::require_not_decommissioned(&env);
+
+        // Effects before interactions: lock the contract first so a token
+        // callback during the sweep can't reach any live entrypoint.
+        env.storage().instance().set(&DataKey::Decommissioned, &true);
+        env.storage().instance().set(&DataKey::Paused, &true);
+        Self::extend_instance_ttl(&env);
+
+        let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+        let mut tokens: Vec<Address> = Vec::new(&env);
+        tokens.push_back(env.storage().instance().get(&DataKey::UsdcContract).unwrap());
+        tokens.push_back(env.storage().instance().get(&DataKey::XlmContract).unwrap());
+        for token_contract in extra_tokens.iter() {
+            if !tokens.contains(&token_contract) {
+                tokens.push_back(token_contract);
+            }
+        }
+
+        let contract_address = env.current_contract_address();
+        Self::with_reentrancy_guard(&env, || {
+            for token_contract in tokens.iter() {
+                let client = token::Client::new(&env, &token_contract);
+                let balance = client.balance(&contract_address);
+                if balance > 0 {
+                    client.transfer(&contract_address, &treasury, &balance);
+                }
+            }
+        });
+
+        env.events().publish(
+            (Symbol::new(&env, "contract_decommissioned"), admin),
+            env.ledger().timestamp(),
+        );
+    }
+
+    /// Returns whether the contract has been permanently decommissioned.
+    pub fn is_decommissioned_view(env: Env) -> bool {
+        Self::is_decommissioned(&env)
+    }
+
+    fn is_decommissioned(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::Decommissioned)
+            .unwrap_or(false)
+    }
+
+    /// Panics once `decommission` has run, locking out every admin action.
+    fn require_not_decommissioned(env: &Env) {
+        if Self::is_decommissioned(env) {
+            panic!("contract is decommissioned");
+        }
+    }
+
     /// Returns whether `caller` has at least `required` authority (Issue #394
     /// - Part 2).
     ///
@@ -1527,6 +1750,99 @@ impl Stellar_CardReceiver {
     fn has_authority(env: &Env, caller: &Address, required: Role) -> bool {
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         *caller == stored_admin || Self::has_role(env.clone(), caller.clone(), required)
+    }
+
+    /// Sets a fee discount for an account.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `caller` - The address setting the discount (must authorize this call)
+    /// * `account` - The address to receive the discount
+    /// * `discount_bps` - Discount in basis points (0-10000, where 10000 = 100%)
+    ///
+    /// # Authorization
+    /// Requires `caller` to hold at least the `Operator` role (or be the stored admin).
+    ///
+    /// # Errors
+    /// * `InvalidDiscount` - If `discount_bps` exceeds 10000 (100%)
+    ///
+    /// # Storage
+    /// Stored under a per-address persistent key (`DataKey::Discounts`) following
+    /// the `UserRole` pattern. A zero discount removes the entry to save storage.
+    ///
+    /// # Panics
+    /// Panics if `caller` does not hold at least the `Operator` role, or if
+    /// `caller.require_auth()` fails.
+    pub fn set_discount(
+        env: Env,
+        caller: Address,
+        account: Address,
+        discount_bps: u32,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        if !Self::has_authority(&env, &caller, Role::Operator) {
+            panic!("set_discount requires at least the Operator role");
+        }
+        if discount_bps > 10000 {
+            return Err(Error::InvalidDiscount);
+        }
+
+        let key = DataKey::Discounts(account.clone());
+        if discount_bps == 0 {
+            // Remove entry to save storage when discount is zero
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &discount_bps);
+            // Extend TTL following the same pattern as role entries
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_MAX);
+        }
+        Self::extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Retrieves the discount assigned to an account.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `account` - The address to query
+    ///
+    /// # Returns
+    /// Discount in basis points (0-10000), or 0 if no discount is assigned
+    pub fn get_discount(env: Env, account: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Discounts(account))
+            .unwrap_or(0)
+    }
+
+    /// Calculates the payment amount after applying the account's discount.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `account` - The payer address
+    /// * `amount` - The original payment amount
+    ///
+    /// # Returns
+    /// Net amount after discount (amount - (amount * discount_bps / 10000))
+    fn apply_discount(env: &Env, account: &Address, amount: i128) -> i128 {
+        let discount_bps = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::Discounts(account.clone()))
+            .unwrap_or(0);
+
+        if discount_bps == 0 {
+            return amount;
+        }
+
+        // Calculate discount: amount * discount_bps / 10000
+        // Use saturating_sub to prevent underflow
+        let discount = amount
+            .saturating_mul(discount_bps as i128)
+            .saturating_div(10000);
+        amount.saturating_sub(discount)
     }
 }
 
@@ -6460,6 +6776,94 @@ mod test {
         );
     }
 
+    // ── Admin config update event tests ───────────────────────────────────────
+
+    #[test]
+    fn test_update_treasury_emits_event() {
+        let f = Fixture::new();
+        f.init();
+
+        let new_treasury = Address::generate(&f.env);
+        f.client().update_treasury(&new_treasury);
+
+        // Verify event was emitted
+        assert_eq!(contract_event_count(&f.env, &f.contract_id, "treasury_updated"), 1);
+
+        // Verify treasury was actually updated
+        assert_eq!(f.client().treasury(), new_treasury);
+
+        // Verify event topics and data
+        let events = f.env.events().all();
+        let event = events.last().unwrap();
+        assert_eq!(event.0, f.contract_id);
+
+        let topics: (Symbol, Address, Address) = event.1.try_into_val(&f.env).unwrap();
+        assert_eq!(topics.0, Symbol::new(&f.env, "treasury_updated"));
+        assert_eq!(topics.1, f.treasury); // old treasury
+        assert_eq!(topics.2, new_treasury); // new treasury
+
+        let data: Address = event.2.try_into_val(&f.env).unwrap();
+        assert_eq!(data, f.admin); // admin is in event data
+    }
+
+    #[test]
+    fn test_update_usdc_contract_emits_event() {
+        let f = Fixture::new();
+        f.init();
+
+        let new_usdc = Address::generate(&f.env);
+        f.client().update_usdc_contract(&new_usdc);
+
+        // Verify event was emitted
+        assert_eq!(contract_event_count(&f.env, &f.contract_id, "token_contract_updated"), 1);
+
+        // Verify USDC contract was actually updated
+        assert_eq!(f.client().usdc_contract(), new_usdc);
+
+        // Verify event topics and data
+        let events = f.env.events().all();
+        let event = events.last().unwrap();
+        assert_eq!(event.0, f.contract_id);
+
+        let topics: (Symbol, Symbol, Address, Address) = event.1.try_into_val(&f.env).unwrap();
+        assert_eq!(topics.0, Symbol::new(&f.env, "token_contract_updated"));
+        assert_eq!(topics.1, symbol_short!("USDC")); // asset symbol
+        assert_eq!(topics.2, f.usdc); // old contract
+        assert_eq!(topics.3, new_usdc); // new contract
+
+        let data: Address = event.2.try_into_val(&f.env).unwrap();
+        assert_eq!(data, f.admin); // admin is in event data
+    }
+
+    #[test]
+    fn test_update_xlm_contract_emits_event() {
+        let f = Fixture::new();
+        f.init();
+
+        let new_xlm = Address::generate(&f.env);
+        f.client().update_xlm_contract(&new_xlm);
+
+        // Verify event was emitted
+        assert_eq!(contract_event_count(&f.env, &f.contract_id, "token_contract_updated"), 1);
+
+        // Verify XLM contract was actually updated
+        assert_eq!(f.client().xlm_contract(), new_xlm);
+
+        // Verify event topics and data
+        let events = f.env.events().all();
+        let event = events.last().unwrap();
+        assert_eq!(event.0, f.contract_id);
+
+        let topics: (Symbol, Symbol, Address, Address) = event.1.try_into_val(&f.env).unwrap();
+        assert_eq!(topics.0, Symbol::new(&f.env, "token_contract_updated"));
+        assert_eq!(topics.1, symbol_short!("XLM")); // asset symbol
+        assert_eq!(topics.2, f.xlm_sac); // old contract
+        assert_eq!(topics.3, new_xlm); // new contract
+
+        let data: Address = event.2.try_into_val(&f.env).unwrap();
+        assert_eq!(data, f.admin); // admin is in event data
+    }
+
     // ── Documentation consistency tests (Issue #396 - Part 2) ─────────────────
 
     /// The `Error` docs promise stable numeric codes that clients match on;
@@ -6471,6 +6875,8 @@ mod test {
         assert_eq!(Error::ContractPaused as u32, 3);
         assert_eq!(Error::WithdrawLimitExceeded as u32, 4);
         assert_eq!(Error::DailyWithdrawLimitExceeded as u32, 5);
+        assert_eq!(Error::InvalidRecipient as u32, 6);
+        assert_eq!(Error::InvalidDiscount as u32, 7);
     }
 
     /// The crate docs state `TOKEN_DECIMALS` is 7 and that the TTL threshold
@@ -6479,5 +6885,291 @@ mod test {
     fn test_documented_constants() {
         assert_eq!(TOKEN_DECIMALS, 7);
         assert_eq!(INSTANCE_TTL_THRESHOLD * 2, INSTANCE_TTL_MAX);
+    }
+
+    // ── decommission tests (Issue #671) ───────────────────────────────────────
+
+    fn decommissioned_fixture() -> Fixture {
+        let f = Fixture::new();
+        f.init();
+        f.client().decommission(&Vec::new(&f.env));
+        f
+    }
+
+    #[test]
+    fn test_decommission_sets_permanent_pause_and_sweeps_balances() {
+        let f = Fixture::new();
+        f.init();
+        f.mint_usdc(&f.contract_id, 500);
+        f.mint_xlm(&f.contract_id, 300);
+
+        f.client().decommission(&Vec::new(&f.env));
+
+        assert!(f.client().is_decommissioned_view());
+        assert!(f.client().is_paused_view());
+        assert_eq!(f.usdc_balance(&f.contract_id), 0);
+        assert_eq!(f.xlm_balance(&f.contract_id), 0);
+        assert_eq!(f.usdc_balance(&f.treasury), 500);
+        assert_eq!(f.xlm_balance(&f.treasury), 300);
+        assert_eq!(
+            contract_event_count(&f.env, &f.contract_id, "contract_decommissioned"),
+            1
+        );
+    }
+
+    #[test]
+    fn test_decommission_sweeps_extra_tokens() {
+        let f = Fixture::new();
+        f.init();
+        let other = f
+            .env
+            .register_stellar_asset_contract_v2(f.admin.clone())
+            .address();
+        token::StellarAssetClient::new(&f.env, &other).mint(&f.contract_id, &42);
+
+        let mut extra = Vec::new(&f.env);
+        extra.push_back(other.clone());
+        f.client().decommission(&extra);
+
+        let other_client = token::Client::new(&f.env, &other);
+        assert_eq!(other_client.balance(&f.contract_id), 0);
+        assert_eq!(other_client.balance(&f.treasury), 42);
+    }
+
+    #[test]
+    fn test_payments_rejected_after_decommission() {
+        let f = decommissioned_fixture();
+        f.mint_usdc(&f.payer, 100);
+        f.mint_xlm(&f.payer, 100);
+        let order = order_bytes(&f.env, "order-1");
+        assert_eq!(
+            f.client().try_pay_usdc(&f.payer, &10, &order),
+            Err(Ok(Error::ContractDecommissioned))
+        );
+        assert_eq!(
+            f.client().try_pay_xlm(&f.payer, &10, &order),
+            Err(Ok(Error::ContractDecommissioned))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "contract is decommissioned")]
+    fn test_unpause_locked_after_decommission() {
+        decommissioned_fixture().client().unpause();
+    }
+
+    #[test]
+    #[should_panic(expected = "contract is decommissioned")]
+    fn test_decommission_cannot_run_twice() {
+        let f = decommissioned_fixture();
+        f.client().decommission(&Vec::new(&f.env));
+    }
+
+    #[test]
+    fn test_admin_functions_locked_after_decommission() {
+        let f = decommissioned_fixture();
+        let other = Address::generate(&f.env);
+        let c = f.client();
+        assert!(c.try_pause(&f.admin).is_err());
+        assert!(c.try_upgrade(&BytesN::from_array(&f.env, &[0u8; 32])).is_err());
+        assert!(c
+            .try_rescue_tokens(&f.admin, &f.usdc, &other, &1)
+            .is_err());
+        assert!(c.try_set_withdraw_limits(&f.admin, &None, &None).is_err());
+        assert!(c.try_transfer_admin(&other).is_err());
+        assert!(c.try_grant_role(&other, &Role::Operator).is_err());
+        assert!(c.try_revoke_role(&other).is_err());
+        assert!(c.is_decommissioned_view());
+        assert!(c.is_paused_view());
+    }
+
+    #[test]
+    fn test_contract_decommissioned_error_code() {
+        assert_eq!(Error::ContractDecommissioned as u32, 7);
+    // ── Discount tier tests (Issue #657) ──────────────────────────────────────
+
+    #[test]
+    fn test_set_discount_by_operator() {
+        let f = Fixture::new();
+        f.init();
+        let operator = Address::generate(&f.env);
+        f.client().grant_role(&operator, &Role::Operator);
+
+        let vip = Address::generate(&f.env);
+        let result = f.client().set_discount(&operator, &vip, &500);
+        assert!(result.is_ok());
+        assert_eq!(f.client().get_discount(&vip), 500);
+    }
+
+    #[test]
+    fn test_set_discount_by_admin() {
+        let f = Fixture::new();
+        f.init();
+
+        let vip = Address::generate(&f.env);
+        let result = f.client().set_discount(&f.admin, &vip, &1000);
+        assert!(result.is_ok());
+        assert_eq!(f.client().get_discount(&vip), 1000);
+    }
+
+    #[test]
+    #[should_panic(expected = "set_discount requires at least the Operator role")]
+    fn test_set_discount_requires_operator_role() {
+        let f = Fixture::new();
+        f.init();
+
+        let viewer = Address::generate(&f.env);
+        f.client().grant_role(&viewer, &Role::Viewer);
+
+        let vip = Address::generate(&f.env);
+        f.client().set_discount(&viewer, &vip, &500);
+    }
+
+    #[test]
+    fn test_set_discount_rejects_over_max() {
+        let f = Fixture::new();
+        f.init();
+
+        let vip = Address::generate(&f.env);
+        let result = f.client().try_set_discount(&f.admin, &vip, &10001);
+        assert_eq!(result, Err(Ok(Error::InvalidDiscount)));
+    }
+
+    #[test]
+    fn test_set_discount_accepts_max_discount() {
+        let f = Fixture::new();
+        f.init();
+
+        let vip = Address::generate(&f.env);
+        let result = f.client().set_discount(&f.admin, &vip, &10000);
+        assert!(result.is_ok());
+        assert_eq!(f.client().get_discount(&vip), 10000);
+    }
+
+    #[test]
+    fn test_set_discount_zero_removes_entry() {
+        let f = Fixture::new();
+        f.init();
+
+        let vip = Address::generate(&f.env);
+        f.client().set_discount(&f.admin, &vip, &500);
+        assert_eq!(f.client().get_discount(&vip), 500);
+
+        f.client().set_discount(&f.admin, &vip, &0);
+        assert_eq!(f.client().get_discount(&vip), 0);
+    }
+
+    #[test]
+    fn test_get_discount_returns_zero_for_no_discount() {
+        let f = Fixture::new();
+        f.init();
+
+        let regular = Address::generate(&f.env);
+        assert_eq!(f.client().get_discount(&regular), 0);
+    }
+
+    #[test]
+    fn test_pay_usdc_applies_discount() {
+        let f = Fixture::new();
+        f.init();
+
+        let vip = Address::generate(&f.env);
+        // Set 10% discount (1000 bps)
+        f.client().set_discount(&f.admin, &vip, &1000);
+
+        let payment_amount: i128 = 10_000_000; // 1.0 USDC (7 decimals)
+        f.mint_usdc(&vip, payment_amount);
+
+        let result = f
+            .client()
+            .pay_usdc(&vip, &payment_amount, &order_bytes(&f.env, "vip-001"));
+        assert!(result.is_ok());
+
+        // Treasury should receive 90% of the amount (10% discount)
+        let expected = 9_000_000;
+        assert_eq!(f.usdc_balance(&f.treasury), expected);
+    }
+
+    #[test]
+    fn test_pay_xlm_applies_discount() {
+        let f = Fixture::new();
+        f.init();
+
+        let vip = Address::generate(&f.env);
+        // Set 25% discount (2500 bps)
+        f.client().set_discount(&f.admin, &vip, &2500);
+
+        let payment_amount: i128 = 20_000_000; // 2.0 XLM (7 decimals)
+        f.mint_xlm(&vip, payment_amount);
+
+        let result = f
+            .client()
+            .pay_xlm(&vip, &payment_amount, &order_bytes(&f.env, "vip-xlm-001"));
+        assert!(result.is_ok());
+
+        // Treasury should receive 75% of the amount (25% discount)
+        let expected = 15_000_000;
+        assert_eq!(f.xlm_balance(&f.treasury), expected);
+    }
+
+    #[test]
+    fn test_pay_usdc_no_discount_for_regular_user() {
+        let f = Fixture::new();
+        f.init();
+
+        let regular = Address::generate(&f.env);
+        let payment_amount: i128 = 10_000_000;
+        f.mint_usdc(&regular, payment_amount);
+
+        let result = f
+            .client()
+            .pay_usdc(&regular, &payment_amount, &order_bytes(&f.env, "regular-001"));
+        assert!(result.is_ok());
+
+        // Treasury should receive full amount
+        assert_eq!(f.usdc_balance(&f.treasury), payment_amount);
+    }
+
+    #[test]
+    fn test_100_percent_discount() {
+        let f = Fixture::new();
+        f.init();
+
+        let vip = Address::generate(&f.env);
+        // Set 100% discount (10000 bps)
+        f.client().set_discount(&f.admin, &vip, &10000);
+
+        let payment_amount: i128 = 10_000_000;
+        f.mint_usdc(&vip, payment_amount);
+
+        let result = f
+            .client()
+            .pay_usdc(&vip, &payment_amount, &order_bytes(&f.env, "free-001"));
+        assert!(result.is_ok());
+
+        // Treasury should receive nothing (100% discount)
+        assert_eq!(f.usdc_balance(&f.treasury), 0);
+    }
+
+    #[test]
+    fn test_discount_calculation_rounds_correctly() {
+        let f = Fixture::new();
+        f.init();
+
+        let vip = Address::generate(&f.env);
+        // Set 5% discount (500 bps)
+        f.client().set_discount(&f.admin, &vip, &500);
+
+        // Test with amount that doesn't divide evenly
+        let payment_amount: i128 = 999;
+        f.mint_usdc(&vip, payment_amount);
+
+        let result = f
+            .client()
+            .pay_usdc(&vip, &payment_amount, &order_bytes(&f.env, "round-001"));
+        assert!(result.is_ok());
+
+        // 999 - (999 * 500 / 10000) = 999 - 49 = 950
+        assert_eq!(f.usdc_balance(&f.treasury), 950);
     }
 }
