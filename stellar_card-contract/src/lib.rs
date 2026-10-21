@@ -1627,6 +1627,123 @@ mod test {
         count
     }
 
+    // ── blacklist tests (#661) ────────────────────────────────────────────────
+
+    #[test]
+    fn test_blacklisted_payer_cannot_pay_usdc_or_xlm() {
+        let f = Fixture::new();
+        f.init();
+        f.mint_usdc(&f.payer, 1_000);
+        f.mint_xlm(&f.payer, 1_000);
+
+        f.client().set_blacklisted(&f.admin, &f.payer, &true);
+        assert!(f.client().is_blacklisted_view(&f.payer));
+
+        assert_eq!(
+            f.client()
+                .try_pay_usdc(&f.payer, &100, &order_bytes(&f.env, "o1")),
+            Err(Ok(Error::AddressBlacklisted))
+        );
+        assert_eq!(
+            f.client()
+                .try_pay_xlm(&f.payer, &100, &order_bytes(&f.env, "o2")),
+            Err(Ok(Error::AddressBlacklisted))
+        );
+        assert_eq!(f.usdc_balance(&f.payer), 1_000);
+        assert_eq!(f.xlm_balance(&f.payer), 1_000);
+        assert_eq!(f.usdc_balance(&f.treasury), 0);
+    }
+
+    #[test]
+    fn test_blacklist_only_blocks_the_flagged_address() {
+        let f = Fixture::new();
+        f.init();
+        let other = Address::generate(&f.env);
+        f.mint_usdc(&other, 500);
+
+        f.client().set_blacklisted(&f.admin, &f.payer, &true);
+        f.client()
+            .pay_usdc(&other, &200, &order_bytes(&f.env, "ok"));
+        assert_eq!(f.usdc_balance(&f.treasury), 200);
+    }
+
+    #[test]
+    fn test_unblacklisted_payer_can_pay_again() {
+        let f = Fixture::new();
+        f.init();
+        f.mint_usdc(&f.payer, 1_000);
+
+        f.client().set_blacklisted(&f.admin, &f.payer, &true);
+        f.client().set_blacklisted(&f.admin, &f.payer, &false);
+        assert!(!f.client().is_blacklisted_view(&f.payer));
+
+        f.client()
+            .pay_usdc(&f.payer, &300, &order_bytes(&f.env, "again"));
+        assert_eq!(f.usdc_balance(&f.treasury), 300);
+    }
+
+    #[test]
+    fn test_operator_can_set_blacklisted() {
+        let f = Fixture::new();
+        f.init();
+        let operator = Address::generate(&f.env);
+        f.client().grant_role(&operator, &Role::Operator);
+
+        f.client().set_blacklisted(&operator, &f.payer, &true);
+        assert!(f.client().is_blacklisted_view(&f.payer));
+    }
+
+    #[test]
+    #[should_panic(expected = "set_blacklisted requires at least the Operator role")]
+    fn test_viewer_cannot_set_blacklisted() {
+        let f = Fixture::new();
+        f.init();
+        let viewer = Address::generate(&f.env);
+        f.client().grant_role(&viewer, &Role::Viewer);
+        f.client().set_blacklisted(&viewer, &f.payer, &true);
+    }
+
+    #[test]
+    #[should_panic(expected = "set_blacklisted requires at least the Operator role")]
+    fn test_address_without_role_cannot_set_blacklisted() {
+        let f = Fixture::new();
+        f.init();
+        let stranger = Address::generate(&f.env);
+        f.client().set_blacklisted(&stranger, &f.payer, &true);
+    }
+
+    #[test]
+    fn test_blacklist_events_only_on_state_changes() {
+        // `env.events().all()` reflects the most recent invocation only, so
+        // each call is checked on its own.
+        let f = Fixture::new();
+        f.init();
+        let count = |name: &str| contract_event_count(&f.env, &f.contract_id, name);
+
+        f.client().set_blacklisted(&f.admin, &f.payer, &true);
+        assert_eq!(count("address_blacklisted"), 1);
+        f.client().set_blacklisted(&f.admin, &f.payer, &true);
+        assert_eq!(count("address_blacklisted"), 0);
+
+        f.client().set_blacklisted(&f.admin, &f.payer, &false);
+        assert_eq!(count("address_unblacklisted"), 1);
+        f.client().set_blacklisted(&f.admin, &f.payer, &false);
+        assert_eq!(count("address_unblacklisted"), 0);
+    }
+
+    #[test]
+    fn test_pause_takes_precedence_over_blacklist() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_blacklisted(&f.admin, &f.payer, &true);
+        f.client().pause(&f.admin);
+        assert_eq!(
+            f.client()
+                .try_pay_usdc(&f.payer, &1, &order_bytes(&f.env, "p")),
+            Err(Ok(Error::ContractPaused))
+        );
+    }
+
     // ── init tests ────────────────────────────────────────────────────────────
 
     #[test]
