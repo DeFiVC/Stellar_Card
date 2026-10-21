@@ -280,7 +280,7 @@ impl Stellar_CardReceiver {
     /// # Validation
     /// All parameters are checked by `validate_init_params` before any state
     /// is written (Issue #399 - Part 2): the receiver contract can't be used
-    /// for any role; the admin can't be the treasury or a token contract;
+    /// for any role; the admin can't be a token contract;
     /// the token contracts must differ and not double as the treasury; and
     /// both must implement the token interface with 7 decimals; and the
     /// native XLM asset can't be passed as `usdc_contract` (Issue #389 -
@@ -367,8 +367,8 @@ impl Stellar_CardReceiver {
     /// # Rules
     /// * No role (admin, treasury, USDC, XLM) may be the receiver contract
     ///   itself.
-    /// * The admin must not be the treasury (accidental self-payment) or
-    ///   either token contract (a token contract can't sign admin actions,
+    /// * The admin must not be either token contract (a token contract can't
+    ///   sign admin actions,
     ///   so the contract would be unmanageable).
     /// * USDC and XLM must be different contracts, and the treasury must not
     ///   be either of them.
@@ -406,10 +406,6 @@ impl Stellar_CardReceiver {
             panic!("xlm_contract cannot be the contract itself");
         }
 
-        // Prevent admin and treasury from being the same (accidental self-payment)
-        if admin == treasury {
-            panic!("admin and treasury must be different addresses");
-        }
         if admin == usdc_contract || admin == xlm_contract {
             panic!("admin cannot be a configured token contract");
         }
@@ -2082,6 +2078,27 @@ mod test {
     }
 
     #[test]
+    fn test_init_requires_admin_authorization() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let usdc = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let xlm_sac = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let contract_id = env.register(Stellar_CardReceiver, ());
+        let client = Stellar_CardReceiverClient::new(&env, &contract_id);
+
+        assert!(client
+            .try_init(&admin, &treasury, &usdc, &xlm_sac)
+            .is_err());
+        assert!(client.try_admin().is_err());
+        assert_eq!(contract_event_count(&env, &contract_id, "init"), 0);
+    }
+
+    #[test]
     fn test_init_rejects_invalid_address_combinations_without_writing_state() {
         let f = Fixture::new();
         let client = f.client();
@@ -2091,9 +2108,6 @@ mod test {
             .is_err());
         assert!(client
             .try_init(&f.admin, &f.contract_id, &f.usdc, &f.xlm_sac)
-            .is_err());
-        assert!(client
-            .try_init(&f.admin, &f.admin, &f.usdc, &f.xlm_sac)
             .is_err());
         assert!(client
             .try_init(&f.admin, &f.treasury, &f.usdc, &f.usdc)
@@ -2171,10 +2185,11 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "admin and treasury must be different addresses")]
-    fn test_init_rejects_admin_as_treasury() {
+    fn test_init_accepts_admin_as_treasury() {
         let f = Fixture::new();
         f.client().init(&f.admin, &f.admin, &f.usdc, &f.xlm_sac);
+        assert_eq!(f.client().admin(), f.admin);
+        assert_eq!(f.client().treasury(), f.admin);
     }
 
     #[test]
@@ -2233,8 +2248,8 @@ mod test {
     #[test]
     #[should_panic(expected = "usdc_contract does not implement the token interface")]
     fn test_init_rejects_account_address_as_usdc_contract() {
-        // A plain generated address has no contract deployed behind it —
-        // e.g. a G-address pasted where a C-address was expected.
+        // Soroban Address has no null sentinel. A plain account address is
+        // rejected here because token parameters must identify token contracts.
         let f = Fixture::new();
         let account = Address::generate(&f.env);
         f.client().init(&f.admin, &f.treasury, &account, &f.xlm_sac);
