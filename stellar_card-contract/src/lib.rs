@@ -821,6 +821,107 @@ impl Stellar_CardReceiver {
         Self::is_paused(&env)
     }
 
+    /// Updates the treasury address.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `new_treasury` - The new treasury address
+    ///
+    /// # Authorization
+    /// Only the admin can call this function.
+    ///
+    /// # Events
+    /// Emits: topics=[Symbol("treasury_updated"), old_treasury, new_treasury], value=admin
+    ///
+    /// # Panics
+    /// Panics if called before `init` or if `admin.require_auth()` fails.
+    pub fn update_treasury(env: Env, new_treasury: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let old_treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+        env.storage().instance().set(&DataKey::Treasury, &new_treasury);
+        Self::extend_instance_ttl(&env);
+
+        // Emit treasury update event
+        env.events().publish(
+            (
+                Symbol::new(&env, "treasury_updated"),
+                old_treasury,
+                new_treasury,
+            ),
+            admin,
+        );
+    }
+
+    /// Updates the USDC token contract address.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `new_contract` - The new USDC contract address
+    ///
+    /// # Authorization
+    /// Only the admin can call this function.
+    ///
+    /// # Events
+    /// Emits: topics=[Symbol("token_contract_updated"), Symbol("USDC"), old_contract, new_contract], value=admin
+    ///
+    /// # Panics
+    /// Panics if called before `init` or if `admin.require_auth()` fails.
+    pub fn update_usdc_contract(env: Env, new_contract: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let old_contract: Address = env.storage().instance().get(&DataKey::UsdcContract).unwrap();
+        env.storage().instance().set(&DataKey::UsdcContract, &new_contract);
+        Self::extend_instance_ttl(&env);
+
+        // Emit token contract update event
+        env.events().publish(
+            (
+                Symbol::new(&env, "token_contract_updated"),
+                symbol_short!("USDC"),
+                old_contract,
+                new_contract,
+            ),
+            admin,
+        );
+    }
+
+    /// Updates the XLM token contract address.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `new_contract` - The new XLM contract address
+    ///
+    /// # Authorization
+    /// Only the admin can call this function.
+    ///
+    /// # Events
+    /// Emits: topics=[Symbol("token_contract_updated"), Symbol("XLM"), old_contract, new_contract], value=admin
+    ///
+    /// # Panics
+    /// Panics if called before `init` or if `admin.require_auth()` fails.
+    pub fn update_xlm_contract(env: Env, new_contract: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let old_contract: Address = env.storage().instance().get(&DataKey::XlmContract).unwrap();
+        env.storage().instance().set(&DataKey::XlmContract, &new_contract);
+        Self::extend_instance_ttl(&env);
+
+        // Emit token contract update event
+        env.events().publish(
+            (
+                Symbol::new(&env, "token_contract_updated"),
+                symbol_short!("XLM"),
+                old_contract,
+                new_contract,
+            ),
+            admin,
+        );
+    }
+
     /// Upgrades the contract WASM code.
     ///
     /// # Arguments
@@ -6265,6 +6366,94 @@ mod test {
             baseline,
             after
         );
+    }
+
+    // ── Admin config update event tests ───────────────────────────────────────
+
+    #[test]
+    fn test_update_treasury_emits_event() {
+        let f = Fixture::new();
+        f.init();
+
+        let new_treasury = Address::generate(&f.env);
+        f.client().update_treasury(&new_treasury);
+
+        // Verify event was emitted
+        assert_eq!(contract_event_count(&f.env, &f.contract_id, "treasury_updated"), 1);
+
+        // Verify treasury was actually updated
+        assert_eq!(f.client().treasury(), new_treasury);
+
+        // Verify event topics and data
+        let events = f.env.events().all();
+        let event = events.last().unwrap();
+        assert_eq!(event.0, f.contract_id);
+
+        let topics: (Symbol, Address, Address) = event.1.try_into_val(&f.env).unwrap();
+        assert_eq!(topics.0, Symbol::new(&f.env, "treasury_updated"));
+        assert_eq!(topics.1, f.treasury); // old treasury
+        assert_eq!(topics.2, new_treasury); // new treasury
+
+        let data: Address = event.2.try_into_val(&f.env).unwrap();
+        assert_eq!(data, f.admin); // admin is in event data
+    }
+
+    #[test]
+    fn test_update_usdc_contract_emits_event() {
+        let f = Fixture::new();
+        f.init();
+
+        let new_usdc = Address::generate(&f.env);
+        f.client().update_usdc_contract(&new_usdc);
+
+        // Verify event was emitted
+        assert_eq!(contract_event_count(&f.env, &f.contract_id, "token_contract_updated"), 1);
+
+        // Verify USDC contract was actually updated
+        assert_eq!(f.client().usdc_contract(), new_usdc);
+
+        // Verify event topics and data
+        let events = f.env.events().all();
+        let event = events.last().unwrap();
+        assert_eq!(event.0, f.contract_id);
+
+        let topics: (Symbol, Symbol, Address, Address) = event.1.try_into_val(&f.env).unwrap();
+        assert_eq!(topics.0, Symbol::new(&f.env, "token_contract_updated"));
+        assert_eq!(topics.1, symbol_short!("USDC")); // asset symbol
+        assert_eq!(topics.2, f.usdc); // old contract
+        assert_eq!(topics.3, new_usdc); // new contract
+
+        let data: Address = event.2.try_into_val(&f.env).unwrap();
+        assert_eq!(data, f.admin); // admin is in event data
+    }
+
+    #[test]
+    fn test_update_xlm_contract_emits_event() {
+        let f = Fixture::new();
+        f.init();
+
+        let new_xlm = Address::generate(&f.env);
+        f.client().update_xlm_contract(&new_xlm);
+
+        // Verify event was emitted
+        assert_eq!(contract_event_count(&f.env, &f.contract_id, "token_contract_updated"), 1);
+
+        // Verify XLM contract was actually updated
+        assert_eq!(f.client().xlm_contract(), new_xlm);
+
+        // Verify event topics and data
+        let events = f.env.events().all();
+        let event = events.last().unwrap();
+        assert_eq!(event.0, f.contract_id);
+
+        let topics: (Symbol, Symbol, Address, Address) = event.1.try_into_val(&f.env).unwrap();
+        assert_eq!(topics.0, Symbol::new(&f.env, "token_contract_updated"));
+        assert_eq!(topics.1, symbol_short!("XLM")); // asset symbol
+        assert_eq!(topics.2, f.xlm_sac); // old contract
+        assert_eq!(topics.3, new_xlm); // new contract
+
+        let data: Address = event.2.try_into_val(&f.env).unwrap();
+        assert_eq!(data, f.admin); // admin is in event data
     }
 
     // ── Documentation consistency tests (Issue #396 - Part 2) ─────────────────
