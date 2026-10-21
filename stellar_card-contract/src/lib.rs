@@ -104,8 +104,10 @@
 //! | `WithdrawLimitPerCall` | instance   | only while a per-call limit is set             |
 //! | `WithdrawLimitPerDay`  | instance   | only while a daily limit is set                |
 //! | `DailyWithdrawn`       | instance   | after the first `rescue_tokens`; one slot, reused every day |
+//! | `PaymentRateLimitConfig`| instance   | only when the admin overrides the default payment rate |
 //! | `UserRole(address)`    | persistent | while `address` holds a role                   |
 //! | `Blacklist(address)`   | persistent | only while `address` is blacklisted (absent means allowed) |
+//! | `PaymentRateLimit(address)` | temporary | recent payment ledgers within the configured window |
 //! | `ReentrancyGuard`      | temporary  | only during a guarded external call            |
 
 #![no_std]
@@ -128,6 +130,9 @@ const INSTANCE_TTL_MAX: u32 = 17_280_000;
 /// extension only fires roughly once every ~500 days' worth of calls
 /// instead of on (almost) every single one.
 const INSTANCE_TTL_THRESHOLD: u32 = INSTANCE_TTL_MAX / 2;
+const DEFAULT_PAYMENT_LIMIT: u32 = 10;
+const DEFAULT_PAYMENT_WINDOW: u32 = 100;
+const MAX_PAYMENT_LIMIT: u32 = 1_000;
 
 /// Decimal precision `init` requires of both token contracts (Issue #399 -
 /// Part 2). Every Stellar Asset Contract — including the USDC and native XLM
@@ -194,6 +199,10 @@ pub enum DataKey {
     /// Maximum cumulative amount `rescue_tokens` may move across all calls
     /// within a single day. Key absent means no daily cap.
     WithdrawLimitPerDay,
+    /// Per-payer payment counter for the current ledger window. Temporary storage.
+    PaymentRateLimit(Address),
+    /// Optional `(max_payments, window_ledgers)` payment-rate configuration.
+    PaymentRateLimitConfig,
     /// `(day, total)`: the running total withdrawn via `rescue_tokens` on
     /// `day` (ledger timestamp / 86400). A stored `day` older than today
     /// means nothing has been withdrawn today.
@@ -255,6 +264,14 @@ pub enum Error {
     ContractDecommissioned = 7,
     /// Discount value exceeds the maximum allowed (10000 basis points = 100%)
     InvalidDiscount = 7,
+    /// Payment metadata exceeds the 64-byte limit
+    InvalidMetadata = 8,
+    /// A financial calculation exceeded the range of its integer type
+    ArithmeticOverflow = 9,
+    /// Payer exceeded the configured payment rate
+    RateLimitExceeded = 10,
+    /// Payment rate parameters are zero or exceed supported bounds
+    InvalidRateLimit = 11,
 }
 
 /// The stellar_card card receiver contract.
@@ -280,7 +297,7 @@ impl Stellar_CardReceiver {
     /// # Validation
     /// All parameters are checked by `validate_init_params` before any state
     /// is written (Issue #399 - Part 2): the receiver contract can't be used
-    /// for any role; the admin can't be the treasury or a token contract;
+    /// for any role; the admin can't be a token contract;
     /// the token contracts must differ and not double as the treasury; and
     /// both must implement the token interface with 7 decimals; and the
     /// native XLM asset can't be passed as `usdc_contract` (Issue #389 -
@@ -367,8 +384,8 @@ impl Stellar_CardReceiver {
     /// # Rules
     /// * No role (admin, treasury, USDC, XLM) may be the receiver contract
     ///   itself.
-    /// * The admin must not be the treasury (accidental self-payment) or
-    ///   either token contract (a token contract can't sign admin actions,
+    /// * The admin must not be either token contract (a token contract can't
+    ///   sign admin actions,
     ///   so the contract would be unmanageable).
     /// * USDC and XLM must be different contracts, and the treasury must not
     ///   be either of them.
@@ -406,10 +423,6 @@ impl Stellar_CardReceiver {
             panic!("xlm_contract cannot be the contract itself");
         }
 
-        // Prevent admin and treasury from being the same (accidental self-payment)
-        if admin == treasury {
-            panic!("admin and treasury must be different addresses");
-        }
         if admin == usdc_contract || admin == xlm_contract {
             panic!("admin cannot be a configured token contract");
         }
@@ -709,6 +722,87 @@ impl Stellar_CardReceiver {
             .extend_ttl(key, INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_MAX);
     }
 
+    /// Configures the maximum payments per payer and the rolling ledger window.
+    /// The window is bounded so temporary storage can retain each payer's
+    /// counter through the full configured period.
+    pub fn set_payment_rate_limit(
+        env: Env,
+        caller: Address,
+        max_payments: u32,
+        window_ledgers: u32,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_not_decommissioned(&env);
+        if !Self::has_admin_authority(&env, &caller) {
+            panic!("set_payment_rate_limit requires the Admin role");
+        }
+        if max_payments == 0
+            || max_payments > MAX_PAYMENT_LIMIT
+            || window_ledgers == 0
+            || window_ledgers > INSTANCE_TTL_MAX / 2
+        {
+            return Err(Error::InvalidRateLimit);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentRateLimitConfig, &(max_payments, window_ledgers));
+        Self::extend_instance_ttl(&env);
+        env.events().publish(
+            (Symbol::new(&env, "payment_rate_limit_set"), caller),
+            (max_payments, window_ledgers),
+        );
+        Ok(())
+    }
+
+    /// Returns the configured `(max_payments, window_ledgers)` policy.
+    pub fn payment_rate_limit(env: Env) -> (u32, u32) {
+        env.storage()
+            .instance()
+            .get(&DataKey::PaymentRateLimitConfig)
+            .unwrap_or((DEFAULT_PAYMENT_LIMIT, DEFAULT_PAYMENT_WINDOW))
+    }
+
+    fn next_payment_rate_limit(env: &Env, payer: &Address) -> Result<Vec<u32>, Error> {
+        let (max_payments, window_ledgers) = Self::payment_rate_limit(env.clone());
+        let ledger = env.ledger().sequence();
+        let key = DataKey::PaymentRateLimit(payer.clone());
+        let previous = env
+            .storage()
+            .temporary()
+            .get::<_, Vec<u32>>(&key)
+            .unwrap_or(Vec::new(env));
+        let mut active = Vec::new(env);
+        for payment_ledger in previous.iter() {
+            if ledger
+                .checked_sub(payment_ledger)
+                .is_some_and(|elapsed| elapsed < window_ledgers)
+            {
+                active.push_back(payment_ledger);
+            }
+        }
+        if active.len() >= max_payments {
+            return Err(Error::RateLimitExceeded);
+        }
+        active.push_back(ledger);
+        Ok(active)
+    }
+
+    fn record_payment_rate_limit(
+        env: &Env,
+        payer: &Address,
+        payment_ledgers: &Vec<u32>,
+        window_ledgers: u32,
+    ) {
+        let key = DataKey::PaymentRateLimit(payer.clone());
+        env.storage().temporary().set(&key, payment_ledgers);
+        env.storage().temporary().extend_ttl(
+            &key,
+            window_ledgers,
+            window_ledgers * 2,
+        );
+    }
+
     /// Transfers USDC tokens from a payer to the contract treasury.
     ///
     /// # Arguments
@@ -758,6 +852,8 @@ impl Stellar_CardReceiver {
             return Err(Error::AddressBlacklisted);
         }
         from.require_auth();
+        let payment_ledgers = Self::next_payment_rate_limit(&env, &from)?;
+        let (_, window_ledgers) = Self::payment_rate_limit(env.clone());
 
         let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
         let usdc_contract: Address = env
@@ -767,7 +863,7 @@ impl Stellar_CardReceiver {
             .unwrap();
 
         // Apply discount if the payer has one
-        let net_amount = Self::apply_discount(&env, &from, amount);
+        let net_amount = Self::apply_discount(&env, &from, amount)?;
 
         // The token contract is the only external call in this function, so
         // it is the only step that needs to run under the guard.
@@ -780,9 +876,66 @@ impl Stellar_CardReceiver {
             return Err(Error::TransferFailed);
         }
 
+        Self::record_payment_rate_limit(
+            &env,
+            &from,
+            &payment_ledgers,
+            window_ledgers,
+        );
+
         env.events()
             .publish((symbol_short!("pay_usdc"), order_id, from), amount);
 
+        Self::extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Transfers USDC and emits optional routing metadata with the payment event.
+    /// Metadata is limited to 64 bytes; the standard `pay_usdc` event remains unchanged.
+    pub fn pay_usdc_with_memo(
+        env: Env,
+        from: Address,
+        amount: i128,
+        order_id: Bytes,
+        metadata: Bytes,
+    ) -> Result<(), Error> {
+        if metadata.len() > 64 {
+            return Err(Error::InvalidMetadata);
+        }
+        if Self::is_decommissioned(&env) {
+            return Err(Error::ContractDecommissioned);
+        }
+        if Self::is_paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if Self::is_blacklisted(&env, &from) {
+            return Err(Error::AddressBlacklisted);
+        }
+        from.require_auth();
+
+        let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+        let usdc_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::UsdcContract)
+            .unwrap();
+        let net_amount = Self::apply_discount(&env, &from, amount);
+        let transferred = Self::with_reentrancy_guard(&env, || {
+            token::Client::new(&env, &usdc_contract)
+                .try_transfer(&from, &treasury, &net_amount)
+                .is_ok()
+        });
+        if !transferred {
+            return Err(Error::TransferFailed);
+        }
+
+        env.events().publish(
+            (symbol_short!("pay_usdc"), order_id, from),
+            (amount, metadata),
+        );
         Self::extend_instance_ttl(&env);
         Ok(())
     }
@@ -829,12 +982,14 @@ impl Stellar_CardReceiver {
             return Err(Error::AddressBlacklisted);
         }
         from.require_auth();
+        let payment_ledgers = Self::next_payment_rate_limit(&env, &from)?;
+        let (_, window_ledgers) = Self::payment_rate_limit(env.clone());
 
         let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
         let xlm_contract: Address = env.storage().instance().get(&DataKey::XlmContract).unwrap();
 
         // Apply discount if the payer has one
-        let net_amount = Self::apply_discount(&env, &from, amount);
+        let net_amount = Self::apply_discount(&env, &from, amount)?;
 
         // The token contract is the only external call in this function, so
         // it is the only step that needs to run under the guard.
@@ -847,9 +1002,62 @@ impl Stellar_CardReceiver {
             return Err(Error::TransferFailed);
         }
 
+        Self::record_payment_rate_limit(
+            &env,
+            &from,
+            &payment_ledgers,
+            window_ledgers,
+        );
+
         env.events()
             .publish((symbol_short!("pay_xlm"), order_id, from), amount);
 
+        Self::extend_instance_ttl(&env);
+        Ok(())
+    }
+
+    /// Transfers XLM and emits optional routing metadata with the payment event.
+    /// Metadata is limited to 64 bytes; the standard `pay_xlm` event remains unchanged.
+    pub fn pay_xlm_with_memo(
+        env: Env,
+        from: Address,
+        amount: i128,
+        order_id: Bytes,
+        metadata: Bytes,
+    ) -> Result<(), Error> {
+        if metadata.len() > 64 {
+            return Err(Error::InvalidMetadata);
+        }
+        if Self::is_decommissioned(&env) {
+            return Err(Error::ContractDecommissioned);
+        }
+        if Self::is_paused(&env) {
+            return Err(Error::ContractPaused);
+        }
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if Self::is_blacklisted(&env, &from) {
+            return Err(Error::AddressBlacklisted);
+        }
+        from.require_auth();
+
+        let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+        let xlm_contract: Address = env.storage().instance().get(&DataKey::XlmContract).unwrap();
+        let net_amount = Self::apply_discount(&env, &from, amount);
+        let transferred = Self::with_reentrancy_guard(&env, || {
+            token::Client::new(&env, &xlm_contract)
+                .try_transfer(&from, &treasury, &net_amount)
+                .is_ok()
+        });
+        if !transferred {
+            return Err(Error::TransferFailed);
+        }
+
+        env.events().publish(
+            (symbol_short!("pay_xlm"), order_id, from),
+            (amount, metadata),
+        );
         Self::extend_instance_ttl(&env);
         Ok(())
     }
@@ -1138,7 +1346,11 @@ impl Stellar_CardReceiver {
 
         let day = Self::current_day(&env);
         let withdrawn_today = Self::withdrawn_on(&env, day);
-        let new_total = withdrawn_today.saturating_add(amount);
+        // Record only exact totals; saturating here could silently undercount
+        // withdrawals and bypass a configured daily limit.
+        let new_total = withdrawn_today
+            .checked_add(amount)
+            .ok_or(Error::ArithmeticOverflow)?;
 
         if let Some(daily_limit) = env
             .storage()
@@ -1825,8 +2037,10 @@ impl Stellar_CardReceiver {
     /// * `amount` - The original payment amount
     ///
     /// # Returns
-    /// Net amount after discount (amount - (amount * discount_bps / 10000))
-    fn apply_discount(env: &Env, account: &Address, amount: i128) -> i128 {
+    /// Net amount after discount (amount - (amount * discount_bps / 10000)).
+    /// Splitting amount into quotient and remainder avoids overflowing the
+    /// intermediate product for large, otherwise valid payment amounts.
+    fn apply_discount(env: &Env, account: &Address, amount: i128) -> Result<i128, Error> {
         let discount_bps = env
             .storage()
             .persistent()
@@ -1834,15 +2048,21 @@ impl Stellar_CardReceiver {
             .unwrap_or(0);
 
         if discount_bps == 0 {
-            return amount;
+            return Ok(amount);
         }
 
-        // Calculate discount: amount * discount_bps / 10000
-        // Use saturating_sub to prevent underflow
-        let discount = amount
-            .saturating_mul(discount_bps as i128)
-            .saturating_div(10000);
-        amount.saturating_sub(discount)
+        let basis_points = i128::from(discount_bps);
+        let discount = (amount / 10_000)
+            .checked_mul(basis_points)
+            .and_then(|whole| {
+                (amount % 10_000)
+                    .checked_mul(basis_points)
+                    .and_then(|fraction| whole.checked_add(fraction / 10_000))
+            })
+            .ok_or(Error::ArithmeticOverflow)?;
+        amount
+            .checked_sub(discount)
+            .ok_or(Error::ArithmeticOverflow)
     }
 }
 
@@ -2082,6 +2302,27 @@ mod test {
     }
 
     #[test]
+    fn test_init_requires_admin_authorization() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let usdc = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let xlm_sac = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let contract_id = env.register(Stellar_CardReceiver, ());
+        let client = Stellar_CardReceiverClient::new(&env, &contract_id);
+
+        assert!(client
+            .try_init(&admin, &treasury, &usdc, &xlm_sac)
+            .is_err());
+        assert!(client.try_admin().is_err());
+        assert_eq!(contract_event_count(&env, &contract_id, "init"), 0);
+    }
+
+    #[test]
     fn test_init_rejects_invalid_address_combinations_without_writing_state() {
         let f = Fixture::new();
         let client = f.client();
@@ -2091,9 +2332,6 @@ mod test {
             .is_err());
         assert!(client
             .try_init(&f.admin, &f.contract_id, &f.usdc, &f.xlm_sac)
-            .is_err());
-        assert!(client
-            .try_init(&f.admin, &f.admin, &f.usdc, &f.xlm_sac)
             .is_err());
         assert!(client
             .try_init(&f.admin, &f.treasury, &f.usdc, &f.usdc)
@@ -2171,10 +2409,11 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "admin and treasury must be different addresses")]
-    fn test_init_rejects_admin_as_treasury() {
+    fn test_init_accepts_admin_as_treasury() {
         let f = Fixture::new();
         f.client().init(&f.admin, &f.admin, &f.usdc, &f.xlm_sac);
+        assert_eq!(f.client().admin(), f.admin);
+        assert_eq!(f.client().treasury(), f.admin);
     }
 
     #[test]
@@ -2233,8 +2472,8 @@ mod test {
     #[test]
     #[should_panic(expected = "usdc_contract does not implement the token interface")]
     fn test_init_rejects_account_address_as_usdc_contract() {
-        // A plain generated address has no contract deployed behind it —
-        // e.g. a G-address pasted where a C-address was expected.
+        // Soroban Address has no null sentinel. A plain account address is
+        // rejected here because token parameters must identify token contracts.
         let f = Fixture::new();
         let account = Address::generate(&f.env);
         f.client().init(&f.admin, &f.treasury, &account, &f.xlm_sac);
@@ -2387,6 +2626,69 @@ mod test {
     }
 
     #[test]
+    fn test_payment_rate_limit_is_configurable_and_defaults_to_ten_per_hundred_ledgers() {
+        let f = Fixture::new();
+        f.init();
+        assert_eq!(f.client().payment_rate_limit(), (10, 100));
+
+        f.client()
+            .set_payment_rate_limit(&f.admin, &3, &25)
+            .unwrap();
+        assert_eq!(f.client().payment_rate_limit(), (3, 25));
+        assert_eq!(
+            f.client().try_set_payment_rate_limit(&f.admin, &0, &25),
+            Err(Ok(Error::InvalidRateLimit))
+        );
+    }
+
+    #[test]
+    fn test_payment_rate_limit_is_shared_across_assets_and_resets_after_window() {
+        let f = Fixture::new();
+        f.init();
+        f.client()
+            .set_payment_rate_limit(&f.admin, &2, &3)
+            .unwrap();
+        f.mint_usdc(&f.payer, 2);
+        f.mint_xlm(&f.payer, 1);
+
+        f.client()
+            .pay_usdc(&f.payer, &1, &order_bytes(&f.env, "rate-usdc-1"));
+        f.client()
+            .pay_xlm(&f.payer, &1, &order_bytes(&f.env, "rate-xlm-1"));
+        assert_eq!(
+            f.client()
+                .try_pay_usdc(&f.payer, &1, &order_bytes(&f.env, "rate-blocked")),
+            Err(Ok(Error::RateLimitExceeded))
+        );
+
+        f.env.ledger().with_mut(|ledger| {
+            ledger.sequence_number += 3;
+        });
+        f.client()
+            .pay_usdc(&f.payer, &1, &order_bytes(&f.env, "rate-reset"));
+        assert_eq!(f.usdc_balance(&f.treasury), 2);
+        assert_eq!(f.xlm_balance(&f.treasury), 1);
+    }
+
+    #[test]
+    fn test_failed_payment_does_not_consume_rate_limit_slot() {
+        let f = Fixture::new();
+        f.init();
+        f.client()
+            .set_payment_rate_limit(&f.admin, &1, &10)
+            .unwrap();
+        let order_id = order_bytes(&f.env, "failed-rate-payment");
+        assert_eq!(
+            f.client().try_pay_usdc(&f.payer, &1, &order_id),
+            Err(Ok(Error::TransferFailed))
+        );
+
+        f.mint_usdc(&f.payer, 1);
+        f.client().pay_usdc(&f.payer, &1, &order_id);
+        assert_eq!(f.usdc_balance(&f.treasury), 1);
+    }
+
+    #[test]
     fn test_pay_usdc_emits_correct_event() {
         let f = Fixture::new();
         f.init();
@@ -2424,6 +2726,64 @@ mod test {
             break;
         }
         assert!(found, "pay_usdc event not found");
+    }
+
+    #[test]
+    fn test_pay_usdc_with_memo_emits_metadata_and_accepts_empty_metadata() {
+        let f = Fixture::new();
+        f.init();
+        let amount = 100_i128;
+        f.mint_usdc(&f.payer, amount * 2);
+
+        let empty = Bytes::new(&f.env);
+        f.client().pay_usdc_with_memo(
+            &f.payer,
+            &amount,
+            &order_bytes(&f.env, "empty-metadata"),
+            &empty,
+        );
+        let metadata = order_bytes(&f.env, "route-a");
+        let order_id = order_bytes(&f.env, "tagged-metadata");
+        f.client()
+            .pay_usdc_with_memo(&f.payer, &amount, &order_id, &metadata);
+
+        let (_, _, data) = f.env.events().all().last().unwrap();
+        let (emitted_amount, emitted_metadata): (i128, Bytes) =
+            data.try_into_val(&f.env).unwrap();
+        assert_eq!(emitted_amount, amount);
+        assert_eq!(emitted_metadata, metadata);
+    }
+
+    #[test]
+    fn test_pay_xlm_with_memo_accepts_metadata_and_rejects_oversized_metadata() {
+        let f = Fixture::new();
+        f.init();
+        let amount = 100_i128;
+        f.mint_xlm(&f.payer, amount);
+        let metadata = order_bytes(&f.env, "xlm-route");
+
+        f.client().pay_xlm_with_memo(
+            &f.payer,
+            &amount,
+            &order_bytes(&f.env, "xlm-metadata"),
+            &metadata,
+        );
+        let (_, _, data) = f.env.events().all().last().unwrap();
+        let (emitted_amount, emitted_metadata): (i128, Bytes) =
+            data.try_into_val(&f.env).unwrap();
+        assert_eq!(emitted_amount, amount);
+        assert_eq!(emitted_metadata, metadata);
+
+        let oversized = Bytes::from_slice(&f.env, &[0; 65]);
+        assert_eq!(
+            f.client().try_pay_xlm_with_memo(
+                &f.payer,
+                &amount,
+                &order_bytes(&f.env, "oversized-metadata"),
+                &oversized,
+            ),
+            Err(Ok(Error::InvalidMetadata))
+        );
     }
 
     #[test]
@@ -5124,7 +5484,12 @@ mod test {
         let result = f
             .client()
             .try_rescue_tokens(&f.admin, &f.usdc, &destination, &0_i128);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+        assert_eq!(
+            f.client()
+                .try_rescue_tokens(&f.admin, &f.usdc, &destination, &-1_i128),
+            Err(Ok(Error::InvalidAmount))
+        );
     }
 
     #[test]
@@ -5160,6 +5525,23 @@ mod test {
         let f = Fixture::new();
         f.init();
         assert_eq!(f.client().withdraw_limits(), (None, None));
+    }
+
+    #[test]
+    fn test_rescue_tokens_returns_arithmetic_overflow_for_daily_total() {
+        let f = Fixture::new();
+        f.init();
+        let day = Stellar_CardReceiver::current_day(&f.env);
+        f.env.as_contract(&f.contract_id, || {
+            Stellar_CardReceiver::set_withdrawn(&f.env, day, i128::MAX);
+        });
+
+        let destination = Address::generate(&f.env);
+        assert_eq!(
+            f.client()
+                .try_rescue_tokens(&f.admin, &f.usdc, &destination, &1_i128),
+            Err(Ok(Error::ArithmeticOverflow))
+        );
     }
 
     #[test]
@@ -6877,6 +7259,10 @@ mod test {
         assert_eq!(Error::DailyWithdrawLimitExceeded as u32, 5);
         assert_eq!(Error::InvalidRecipient as u32, 6);
         assert_eq!(Error::InvalidDiscount as u32, 7);
+        assert_eq!(Error::InvalidMetadata as u32, 8);
+    assert_eq!(Error::ArithmeticOverflow as u32, 9);
+    assert_eq!(Error::RateLimitExceeded as u32, 10);
+    assert_eq!(Error::InvalidRateLimit as u32, 11);
     }
 
     /// The crate docs state `TOKEN_DECIMALS` is 7 and that the TTL threshold
@@ -7110,6 +7496,20 @@ mod test {
         // Treasury should receive 75% of the amount (25% discount)
         let expected = 15_000_000;
         assert_eq!(f.xlm_balance(&f.treasury), expected);
+    }
+
+    #[test]
+    fn test_discount_calculation_handles_i128_max_without_intermediate_overflow() {
+        let f = Fixture::new();
+        f.init();
+
+        let vip = Address::generate(&f.env);
+        f.client().set_discount(&f.admin, &vip, &5000);
+        f.mint_usdc(&vip, i128::MAX);
+        f.client()
+            .pay_usdc(&vip, &i128::MAX, &order_bytes(&f.env, "max-discount"));
+
+        assert_eq!(f.usdc_balance(&f.treasury), i128::MAX - (i128::MAX / 2));
     }
 
     #[test]
