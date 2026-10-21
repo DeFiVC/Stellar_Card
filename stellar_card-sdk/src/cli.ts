@@ -54,10 +54,14 @@ Usage:
   stellar_card status [--order <id>]     Show orders as a table (--json for raw JSON)
   stellar_card balance                   Show the api key's spend budget (--json)
   stellar_card batch-order --file <csv>  Create orders from CSV and export a summary
+  stellar_card logs [--action <name>]    Show recent audit log / transaction history
+                    [--limit <n>] [--tail]   (--action/--limit filter, --tail follows live, --json for raw JSON)
   stellar_card verify-tx <hash> --treasury <G…>
                                      Cryptographically verify an on-chain payment proof
   stellar_card doctor [--contract <C…>]
                                      Check local runtime, backend, Stellar endpoints, and contract
+  stellar_card qr <order-id>             Print a scannable QR code for an order's payment
+                                     (--svg, --png, or --json for other formats)
   stellar_card logout                    Clear cached session tokens and api keys
   stellar_card cache clear               Clear local cached state (same as logout)
   stellar_card mcp                       Start the MCP server over stdio (default)
@@ -112,6 +116,18 @@ Onboarding guide for agents: https://stellar_card.com/skill.md
     return batchOrderCommand(rest);
   }
 
+  if (cmd === 'logs') {
+    const { logsCommand } = await import('./commands/logs');
+    const controller = new AbortController();
+    const onSigint = (): void => controller.abort();
+    process.once('SIGINT', onSigint);
+    try {
+      return await logsCommand(rest, { signal: controller.signal });
+    } finally {
+      process.removeListener('SIGINT', onSigint);
+    }
+  }
+
   if (cmd === 'verify-tx' || cmd === 'verify') {
     const { verifyTxCommand } = await import('./commands/verify');
     return verifyTxCommand(rest);
@@ -130,6 +146,11 @@ Onboarding guide for agents: https://stellar_card.com/skill.md
   if (cmd === 'profile') {
     const { profileCommand } = await import('./commands/profile');
     return profileCommand(rest);
+  }
+
+  if (cmd === 'qr') {
+    const { qrCommand } = await import('./commands/qr');
+    return qrCommand(rest);
   }
 
   if (cmd === 'logout' || cmd === 'cache-clear' || cmd === 'cache') {

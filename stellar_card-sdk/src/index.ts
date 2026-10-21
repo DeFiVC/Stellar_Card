@@ -20,6 +20,8 @@ export type {
   IterateOrdersOptions,
   ReportStatusOptions,
   StellarCardClientOptions,
+  AuditLogEntry,
+  ListAuditLogsOptions,
 } from './client';
 
 export {
