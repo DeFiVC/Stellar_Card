@@ -169,6 +169,25 @@ pub struct TreasurySplit {
     pub percentage: u32,
 }
 
+/// Consolidated read-only view of the contract's configuration (Issue #651).
+///
+/// Returned by [`Stellar_CardReceiver::get_config`] so a client can load the
+/// full deployment context in one call instead of five separate getters.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ContractConfig {
+    /// Contract administrator (`DataKey::Admin`).
+    pub admin: Address,
+    /// Treasury that receives forwarded payments (`DataKey::Treasury`).
+    pub treasury: Address,
+    /// USDC Stellar Asset Contract (`DataKey::UsdcContract`).
+    pub usdc_contract: Address,
+    /// Native XLM Stellar Asset Contract (`DataKey::XlmContract`).
+    pub xlm_contract: Address,
+    /// Whether payments are currently paused (`DataKey::Paused`).
+    pub is_paused: bool,
+}
+
 /// Storage keys for contract state.
 ///
 /// Each variant identifies one storage slot. Most live in instance storage;
@@ -1142,6 +1161,35 @@ impl Stellar_CardReceiver {
     /// `true` if paused, `false` otherwise
     pub fn is_paused_view(env: Env) -> bool {
         Self::is_paused(&env)
+    }
+
+    /// Returns the full contract configuration in a single read-only call
+    /// (Issue #651).
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// A [`ContractConfig`] holding `admin`, `treasury`, `usdc_contract`,
+    /// `xlm_contract` and `is_paused`, identical to what the individual
+    /// getters (`admin`, `treasury`, `usdc_contract`, `xlm_contract`,
+    /// `is_paused_view`) report.
+    ///
+    /// # Authorization
+    /// None required. View function: it only reads instance storage and never
+    /// writes state, so it consumes no state-write fees and cannot be used to
+    /// mutate the contract.
+    ///
+    /// # Panics
+    /// Panics if called before `init` (see `try_get_config` to avoid this).
+    pub fn get_config(env: Env) -> ContractConfig {
+        ContractConfig {
+            admin: Self::admin(env.clone()),
+            treasury: Self::treasury(env.clone()),
+            usdc_contract: Self::usdc_contract(env.clone()),
+            xlm_contract: Self::xlm_contract(env.clone()),
+            is_paused: Self::is_paused(&env),
+        }
     }
 
     /// Updates the treasury address.
@@ -2980,6 +3028,63 @@ mod test {
         assert!(client.try_treasury().is_err());
         assert!(client.try_usdc_contract().is_err());
         assert!(client.try_xlm_contract().is_err());
+        assert!(client.try_get_config().is_err());
+    }
+
+    // ── get_config view (issue #651) ─────────────────────────────────────────
+
+    #[test]
+    fn test_get_config_matches_individual_getters() {
+        let f = Fixture::new();
+        f.init();
+
+        let cfg = f.client().get_config();
+        assert_eq!(cfg.admin, f.client().admin());
+        assert_eq!(cfg.treasury, f.client().treasury());
+        assert_eq!(cfg.usdc_contract, f.client().usdc_contract());
+        assert_eq!(cfg.xlm_contract, f.client().xlm_contract());
+        assert_eq!(cfg.is_paused, f.client().is_paused_view());
+    }
+
+    #[test]
+    fn test_get_config_reflects_pause_state() {
+        let f = Fixture::new();
+        f.init();
+        assert!(!f.client().get_config().is_paused);
+
+        f.client().pause(&f.admin);
+        assert!(f.client().get_config().is_paused);
+
+        f.client().unpause();
+        assert!(!f.client().get_config().is_paused);
+    }
+
+    #[test]
+    fn test_get_config_reflects_admin_and_treasury_updates() {
+        let f = Fixture::new();
+        f.init();
+
+        let new_treasury = Address::generate(&f.env);
+        f.client().update_treasury(&new_treasury);
+        let new_admin = Address::generate(&f.env);
+        f.client().transfer_admin(&new_admin);
+
+        let cfg = f.client().get_config();
+        assert_eq!(cfg.admin, new_admin);
+        assert_eq!(cfg.treasury, new_treasury);
+        // Token addresses are immutable after init.
+        assert_eq!(cfg.usdc_contract, f.usdc);
+        assert_eq!(cfg.xlm_contract, f.xlm_sac);
+    }
+
+    #[test]
+    fn test_get_config_requires_no_authorization() {
+        let f = Fixture::new();
+        f.init();
+        // View call with no signatures at all must still succeed.
+        f.env.mock_auths(&[]);
+        let cfg = f.client().get_config();
+        assert_eq!(cfg.admin, f.admin);
     }
 
     // ── amount validation tests ───────────────────────────────────────────────

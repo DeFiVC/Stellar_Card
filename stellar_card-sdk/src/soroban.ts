@@ -11,6 +11,7 @@ import {
   TransactionBuilder,
   BASE_FEE,
   nativeToScVal,
+  scValToNative,
   rpc,
   xdr,
   type Transaction,
@@ -952,6 +953,75 @@ export function selectContractCall(
     return { fn: 'pay_xlm', amountDecimal: payment.xlm.amount };
   }
   return { fn: 'pay_usdc', amountDecimal: payment.usdc.amount };
+}
+
+/**
+ * Decoded view of `ContractConfig` returned by the receiver contract's
+ * `get_config` entrypoint (issue #651). Field names match the Soroban struct.
+ */
+export interface ContractConfig {
+  admin: string;
+  treasury: string;
+  usdc_contract: string;
+  xlm_contract: string;
+  is_paused: boolean;
+}
+
+/**
+ * Read the receiver contract's full configuration in a single view call
+ * (issue #651).
+ *
+ * Builds a Soroban transaction invoking `get_config`, simulates it against
+ * the RPC (no signing, no submission, no state write), and decodes the
+ * returned `ContractConfig` struct. Requires no authorization.
+ *
+ * @param opts.contractId - Receiver contract address (`C...`)
+ * @param opts.networkPassphrase - Defaults to {@link Networks.PUBLIC}
+ * @param opts.sorobanRpcUrl - Defaults to the public endpoint for the network
+ * @returns The decoded {@link ContractConfig}
+ * @throws {Error} When the contract is unreachable or `get_config` reverts
+ *   (e.g. called before `init`)
+ *
+ * @example
+ * ```typescript
+ * const cfg = await fetchContractConfig({ contractId: payment.contract_id });
+ * if (cfg.is_paused) throw new Error('contract is paused');
+ * ```
+ */
+export async function fetchContractConfig(opts: {
+  contractId: string;
+  networkPassphrase?: string;
+  sorobanRpcUrl?: string;
+}): Promise<ContractConfig> {
+  const networkPassphrase = opts.networkPassphrase ?? Networks.PUBLIC;
+  const server = new rpc.Server(opts.sorobanRpcUrl ?? getSorobanRpcUrl(networkPassphrase));
+
+  // Simulation only needs a well-formed source account; sequence `0` is never
+  // submitted, so any valid keypair-shaped account works for a read-only call.
+  const source = new Account(opts.contractId, '0');
+  const contract = new Contract(opts.contractId);
+  const tx = new TransactionBuilder(source, {
+    fee: BASE_FEE,
+    networkPassphrase,
+  })
+    .addOperation(contract.call('get_config'))
+    .setTimeout(60)
+    .build();
+
+  const sim = await simulateContractTransaction(tx, server);
+  const retval = (sim as rpc.Api.SimulateTransactionSuccessResponse).result?.retval;
+  if (!retval) {
+    throw new Error('get_config simulation returned no result value');
+  }
+
+  const raw = scValToNative(retval) as Record<string, unknown>;
+  return {
+    admin: String(raw.admin),
+    treasury: String(raw.treasury),
+    usdc_contract: String(raw.usdc_contract),
+    xlm_contract: String(raw.xlm_contract),
+    is_paused: Boolean(raw.is_paused),
+  };
 }
 
 // Re-export xdr so callers in sibling modules can construct DecoratedSignature
