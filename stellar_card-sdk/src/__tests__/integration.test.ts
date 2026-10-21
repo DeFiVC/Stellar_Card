@@ -194,4 +194,272 @@ describe('SDK integration (sandbox mode)', () => {
       globalThis.fetch = origFetch;
     }
   });
+
+  describe('E2E order creation and card reveal flow', () => {
+    it('creates order with USDC payment', async () => {
+      const origFetch = globalThis.fetch;
+      globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+        const urlStr = String(url);
+        if (urlStr.endsWith('/orders')) {
+          return new Response(
+            JSON.stringify({
+              order_id: 'order-e2e-1',
+              status: 'pending_payment',
+              phase: 'awaiting_payment',
+              amount_usdc: '10.00',
+              payment_asset: 'usdc',
+              payment: {
+                type: 'soroban_contract',
+                contract_id: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4',
+                order_id: 'order-e2e-1',
+                usdc: { amount: '10.0000000', asset: 'USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN' },
+              },
+              poll_url: '/v1/orders/order-e2e-1',
+              budget: { spent_usdc: '10.00', limit_usdc: '100.00', remaining_usdc: '90.00' },
+              created_at: '2026-01-01T00:00:00Z',
+            }),
+            { status: 201 },
+          );
+        }
+        return new Response('', { status: 404 });
+      }) as typeof fetch;
+
+      try {
+        const client = new Stellar_CardClient({
+          apiKey: 'stellar_card_testkey',
+          baseUrl: 'http://test/v1',
+          retry: { attempts: 0 },
+        });
+        const order = await client.createOrder({ amount_usdc: '10.00' });
+
+        expect(order.order_id).toBe('order-e2e-1');
+        expect(order.status).toBe('pending_payment');
+        expect(order.phase).toBe('awaiting_payment');
+        expect(order.payment_asset).toBe('usdc');
+        expect(order.payment.type).toBe('soroban_contract');
+        expect(order.budget.spent_usdc).toBe('10.00');
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it('polls order status until fulfillment', async () => {
+      let pollCount = 0;
+      const origFetch = globalThis.fetch;
+      globalThis.fetch = (async (url: string | URL) => {
+        const urlStr = String(url);
+        if (urlStr.endsWith('/order-e2e-2')) {
+          pollCount++;
+          if (pollCount === 1) {
+            return new Response(
+              JSON.stringify({
+                order_id: 'order-e2e-2',
+                status: 'pending_payment',
+                phase: 'awaiting_payment',
+                amount_usdc: '5.00',
+              }),
+              { status: 200 },
+            );
+          }
+          if (pollCount === 2) {
+            return new Response(
+              JSON.stringify({
+                order_id: 'order-e2e-2',
+                status: 'processing',
+                phase: 'soroban_processing',
+                amount_usdc: '5.00',
+              }),
+              { status: 200 },
+            );
+          }
+          return new Response(
+            JSON.stringify({
+              order_id: 'order-e2e-2',
+              status: 'delivered',
+              phase: 'ready',
+              amount_usdc: '5.00',
+              card: {
+                number: '4111111111111111',
+                cvv: '123',
+                expiry: '12/27',
+                brand: 'Visa',
+              },
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response('', { status: 404 });
+      }) as typeof fetch;
+
+      try {
+        const client = new Stellar_CardClient({
+          apiKey: 'stellar_card_testkey',
+          baseUrl: 'http://test/v1',
+          retry: { attempts: 0 },
+        });
+
+        const statuses: string[] = [];
+        for (let i = 0; i < 3; i++) {
+          const order = await client.getOrder('order-e2e-2');
+          statuses.push(order.status);
+          if (order.status === 'delivered') break;
+        }
+
+        expect(statuses).toEqual(['pending_payment', 'processing', 'delivered']);
+        expect(pollCount).toBe(3);
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it('reveals card with valid PAN and expiry format', async () => {
+      const origFetch = globalThis.fetch;
+      globalThis.fetch = (async (url: string | URL) => {
+        const urlStr = String(url);
+        if (urlStr.endsWith('/order-e2e-3')) {
+          return new Response(
+            JSON.stringify({
+              order_id: 'order-e2e-3',
+              status: 'delivered',
+              phase: 'ready',
+              amount_usdc: '25.00',
+              card: {
+                number: '4111222233334444',
+                cvv: '789',
+                expiry: '08/29',
+                brand: 'Visa',
+              },
+              created_at: '2026-01-01T00:00:00Z',
+              updated_at: '2026-01-01T00:10:00Z',
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response('', { status: 404 });
+      }) as typeof fetch;
+
+      try {
+        const client = new Stellar_CardClient({
+          apiKey: 'stellar_card_testkey',
+          baseUrl: 'http://test/v1',
+          retry: { attempts: 0 },
+        });
+        const order = await client.getOrder('order-e2e-3');
+
+        expect(order.status).toBe('delivered');
+        expect(order.card).toBeDefined();
+        expect(order.card?.number).toBe('4111222233334444');
+
+        // Validate PAN format: 16 digits for Visa
+        const panRegex = /^\d{16}$/;
+        expect(panRegex.test(order.card?.number || '')).toBe(true);
+
+        // Validate expiry format: MM/YY
+        const expiryRegex = /^\d{2}\/\d{2}$/;
+        expect(expiryRegex.test(order.card?.expiry || '')).toBe(true);
+
+        // Validate CVV: 3-4 digits
+        const cvvRegex = /^\d{3,4}$/;
+        expect(cvvRegex.test(order.card?.cvv || '')).toBe(true);
+
+        expect(order.card?.brand).toBe('Visa');
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+
+    it('handles full order workflow: create -> poll -> reveal', async () => {
+      const origFetch = globalThis.fetch;
+      let requestCount = 0;
+
+      globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+        const urlStr = String(url);
+        requestCount++;
+
+        if (urlStr.endsWith('/orders') && init?.method === 'POST') {
+          return new Response(
+            JSON.stringify({
+              order_id: 'order-workflow-1',
+              status: 'pending_payment',
+              phase: 'awaiting_payment',
+              amount_usdc: '15.00',
+              payment_asset: 'xlm',
+              payment: {
+                type: 'soroban_contract',
+                contract_id: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4',
+                order_id: 'order-workflow-1',
+                xlm: { amount: '150.0000000', asset: 'native' },
+              },
+              budget: { spent_usdc: '15.00', limit_usdc: '500.00', remaining_usdc: '485.00' },
+              created_at: '2026-01-01T00:00:00Z',
+            }),
+            { status: 201 },
+          );
+        }
+
+        if (urlStr.includes('/order-workflow-1')) {
+          if (requestCount <= 2) {
+            return new Response(
+              JSON.stringify({
+                order_id: 'order-workflow-1',
+                status: 'processing',
+                phase: 'soroban_processing',
+                amount_usdc: '15.00',
+              }),
+              { status: 200 },
+            );
+          }
+          return new Response(
+            JSON.stringify({
+              order_id: 'order-workflow-1',
+              status: 'delivered',
+              phase: 'ready',
+              amount_usdc: '15.00',
+              card: {
+                number: '4999888877776666',
+                cvv: '456',
+                expiry: '06/28',
+                brand: 'Visa',
+              },
+              created_at: '2026-01-01T00:00:00Z',
+              updated_at: '2026-01-01T00:20:00Z',
+            }),
+            { status: 200 },
+          );
+        }
+
+        return new Response('', { status: 404 });
+      }) as typeof fetch;
+
+      try {
+        const client = new Stellar_CardClient({
+          apiKey: 'stellar_card_testkey',
+          baseUrl: 'http://test/v1',
+          retry: { attempts: 0 },
+        });
+
+        // Create order
+        const createOrder = await client.createOrder({ amount_usdc: '15.00' });
+        expect(createOrder.order_id).toBe('order-workflow-1');
+        expect(createOrder.status).toBe('pending_payment');
+
+        // Poll for completion
+        let order = createOrder;
+        let attempts = 0;
+        while (order.status !== 'delivered' && attempts < 5) {
+          await new Promise((r) => setTimeout(r, 10));
+          order = await client.getOrder('order-workflow-1');
+          attempts++;
+        }
+
+        // Verify card revealed
+        expect(order.status).toBe('delivered');
+        expect(order.card).toBeDefined();
+        expect(order.card?.number).toMatch(/^\d{16}$/);
+        expect(order.card?.expiry).toMatch(/^\d{2}\/\d{2}$/);
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+    });
+  });
 });
