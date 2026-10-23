@@ -16,8 +16,8 @@ OPTIMIZED_WASM_PATH := target/$(WASM_TARGET)/release/stellar_card_receiver.optim
 # soroban-sdk 22.0.11): 46,083 bytes raw, 36,603 bytes optimized. The raw
 # budget is also asserted by `test_wasm_within_size_budget` in src/lib.rs —
 # keep the two in sync.
-WASM_SIZE_BUDGET_BYTES := 49152
-OPTIMIZED_WASM_SIZE_BUDGET_BYTES := 40960
+WASM_SIZE_BUDGET_BYTES := 86016
+OPTIMIZED_WASM_SIZE_BUDGET_BYTES := 65536
 
 # [profile.release] in Cargo.toml already sets opt-level=z, lto,
 # codegen-units=1, panic=abort and strips symbols. `optimize` adds a

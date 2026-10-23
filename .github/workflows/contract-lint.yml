@@ -1,0 +1,50 @@
+name: Contract Lint
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'feature/**'
+    paths:
+      - 'stellar_card-contract/**'
+      - '.github/workflows/contract-lint.yml'
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'stellar_card-contract/**'
+      - '.github/workflows/contract-lint.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clippy:
+    name: cargo clippy (wasm32-unknown-unknown)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: stellar_card-contract
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup target add wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: stellar_card-contract
+
+      # Issue #650: deny every default warning, and additionally switch on
+      # the integer-overflow, unwrap-usage and dead-code lint families so a
+      # regression in any of them fails the build rather than scrolling past
+      # in the log.
+      - name: Run clippy with strict lint configuration
+        run: >
+          cargo clippy --target wasm32-unknown-unknown -- -D warnings
+          -D clippy::unwrap_used
+          -D clippy::arithmetic_side_effects
+          -D dead_code
