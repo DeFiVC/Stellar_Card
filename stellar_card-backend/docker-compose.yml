@@ -1,0 +1,73 @@
+# stellar_card-backend — local development stack.
+#
+# SQLite is the default datastore (a single file under /app/data). A
+# PostgreSQL service is available behind the `postgres` profile for
+# anyone who wants to exercise a networked database locally:
+#
+#   docker compose up                          # backend + SQLite
+#   docker compose --profile postgres up       # backend + Postgres
+#
+# The backend image is built from the multi-stage Dockerfile in this
+# directory; the default target is `runner` (non-root, health-checked,
+# production dependencies only).
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+    image: stellar_card-backend:local
+    container_name: stellar_card-backend
+    ports:
+      - "4000:4000"
+    env_file:
+      - path: ./.env.example
+        required: false
+      - path: ./.env
+        required: false
+    environment:
+      - PORT=4000
+      - NODE_ENV=development
+      - DB_PATH=/app/data/stellar_card.db
+    volumes:
+      - backend-data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:4000/health').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - stellar_card-net
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: stellar_card-postgres
+    profiles: ["postgres"]
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: stellar_card
+      POSTGRES_PASSWORD: stellar_card
+      POSTGRES_DB: stellar_card
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stellar_card -d stellar_card"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - stellar_card-net
+
+volumes:
+  backend-data:
+  postgres-data:
+
+networks:
+  stellar_card-net:
+    driver: bridge
