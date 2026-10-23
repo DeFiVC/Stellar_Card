@@ -158,10 +158,12 @@ export {
   extractContractErrorCode,
   computeFeeRefund,
   extractFeeMetricsFromHorizon,
+  fetchContractConfig,
   CONTRACT_ERROR_MESSAGES,
   CONTRACT_ERROR_MAP,
 } from './soroban';
 export type { ContractPaymentResult } from './types';
+export type { ContractConfig } from './soroban';
 
 export {
   createLogger,
