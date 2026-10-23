@@ -93,14 +93,14 @@
 //! | `transfer_admin`                             | stored admin + new admin  |
 //! | `renounce_role`                              | the role holder itself    |
 //!
-//! ## Storage layout (Issue #395 - Part 2)
+//! ## Storage layout (Issue #395 - Part 2, Issue #636)
 //! Every call loads the whole instance-storage entry, so it is kept small and
 //! bounded — nothing in it grows with usage:
 //!
 //! | Key                    | Storage    | Present when                                  |
 //! |------------------------|------------|-----------------------------------------------|
-//! | `Admin`, `Treasury`, `UsdcContract`, `XlmContract` | instance | always, after `init` |
-//! | `Paused`               | instance   | only while paused (absent means unpaused)      |
+//! | `Config`               | instance   | always, after `init` — packs admin, treasury, paused (Issue #636) |
+//! | `UsdcContract`, `XlmContract` | instance | always, after `init`                  |
 //! | `WithdrawLimitPerCall` | instance   | only while a per-call limit is set             |
 //! | `WithdrawLimitPerDay`  | instance   | only while a daily limit is set                |
 //! | `DailyWithdrawn`       | instance   | after the first `rescue_tokens`; one slot, reused every day |
@@ -109,6 +109,10 @@
 //! | `Blacklist(address)`   | persistent | only while `address` is blacklisted (absent means allowed) |
 //! | `PaymentRateLimit(address)` | temporary | recent payment ledgers within the configured window |
 //! | `ReentrancyGuard`      | temporary  | only during a guarded external call            |
+//!
+//! The legacy `Admin`/`Treasury`/`Paused` slots still readable through
+//! `load_config` for instances deployed before the packing change — see
+//! `stellar_card-contract/docs/storage.md`.
 
 #![no_std]
 use soroban_sdk::{
@@ -169,6 +173,29 @@ pub struct TreasurySplit {
     pub percentage: u32,
 }
 
+/// Packed configuration block (Issue #636).
+///
+/// `admin`, `treasury`, and `paused` used to live under three separate
+/// `DataKey` slots. Instance storage is a single ledger entry whose rent
+/// and CPU fees scale with its serialized size, so three slots paid for
+/// three key encodings on top of the values. Packing them under one
+/// `DataKey::Config` slot removes that redundant overhead and lets a
+/// single read/write move the whole block.
+///
+/// # Upgrade migration
+/// Live instances deployed before this struct existed still hold the
+/// per-key layout. [`load_config`] falls back to those keys and
+/// [`save_config`] retires them on the first write, so a WASM upgrade
+/// migrates lazily without a separate migration entrypoint. See
+/// `stellar_card-contract/docs/storage.md`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Config {
+    pub admin: Address,
+    pub treasury: Address,
+    pub paused: bool,
+}
+
 /// Storage keys for contract state.
 ///
 /// Each variant identifies one storage slot. Most live in instance storage;
@@ -178,6 +205,11 @@ pub struct TreasurySplit {
 #[contracttype]
 pub enum DataKey {
     /// Address that receives forwarded payments. Set once by `init`.
+    ///
+    /// # Storage (Issue #636)
+    /// Legacy slot: superseded by [`DataKey::Config`]. Kept in the enum
+    /// so upgraded instances can still read (and then retire) the old
+    /// per-key layout — see `load_config`.
     Treasury,
     /// List of treasury splits for distributing payments by percentage (Issue #679).
     /// Absent means single treasury mode; present means split mode.
@@ -188,7 +220,17 @@ pub enum DataKey {
     XlmContract,
     /// Address of the contract administrator. Set by `init`, moved by
     /// `transfer_admin`, and always treated as holding `Role::Admin`.
+    ///
+    /// # Storage (Issue #636)
+    /// Legacy slot: superseded by [`DataKey::Config`], which packs the
+    /// admin together with the treasury and paused flag. Kept in the
+    /// enum so upgraded instances can still read (and then retire) the
+    /// old per-key layout — see `load_config`.
     Admin,
+    /// Packed configuration block (Issue #636): `admin`, `treasury`, and
+    /// `paused` in one instance-storage slot. Absent only before `init`
+    /// or while a legacy instance has not yet been touched by a write.
+    Config,
     /// Per-address role assignment. Replaces a single `Roles: Map<Address, Role>`
     /// instance-storage entry: a Map entry grows (and gets re-serialized +
     /// rent-extended) on every single role grant/revoke, regardless of which
@@ -200,9 +242,14 @@ pub enum DataKey {
     /// call that set it.
     ReentrancyGuard,
     /// Circuit breaker: when `true`, `pay_usdc`/`pay_xlm` refuse new
-    /// payments. Only stored while paused — an absent key means unpaused
-    /// (Issue #395 - Part 2), so the common unpaused state costs no bytes in
-    /// the instance entry every call loads.
+    /// payments.
+    ///
+    /// # Storage (Issue #636)
+    /// Legacy slot: the paused flag now lives inside [`DataKey::Config`].
+    /// Kept in the enum so upgraded instances can still read (and then
+    /// retire) the old per-key layout — see `load_config`. The pre-#636
+    /// "absent means unpaused" encoding is preserved on the fallback
+    /// path only.
     Paused,
     /// Maximum amount `rescue_tokens` may move in a single call. Key
     /// absent means no per-call cap is configured.
@@ -316,10 +363,10 @@ impl Stellar_CardReceiver {
     /// native XLM asset can't be passed as `usdc_contract` (Issue #389 -
     /// Part 1), which would mean the two token arguments are swapped.
     ///
-    /// # Storage
-    /// Writes the four configuration addresses to instance storage and grants
-    /// `admin` the `Admin` role (persistent). The contract starts unpaused
-    /// without writing `DataKey::Paused`.
+    /// # Storage (Issue #636)
+    /// Writes `Config` (admin, treasury, paused) as one packed instance
+    /// slot, the two token contracts on their own slots, and grants
+    /// `admin` the `Admin` role (persistent). The contract starts unpaused.
     ///
     /// # Events (Issue #428 - Part 5)
     /// Emits: topics=[Symbol("init"), admin], value=(treasury, usdc_contract, xlm_contract)
@@ -344,23 +391,33 @@ impl Stellar_CardReceiver {
     ) {
         admin.require_auth();
 
-        if env.storage().instance().has(&DataKey::Admin) {
+        // Both the packed (#636) and legacy per-key layouts mark an
+        // initialized instance.
+        if env.storage().instance().has(&DataKey::Config)
+            || env.storage().instance().has(&DataKey::Admin)
+        {
             panic!("already initialized");
         }
 
         Self::validate_init_params(&env, &admin, &treasury, &usdc_contract, &xlm_contract);
 
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::Treasury, &treasury);
+        // Issue #636: admin, treasury, and the paused flag are packed into
+        // a single `DataKey::Config` slot. Token contracts stay on their own
+        // keys — they change independently via the update entrypoints.
+        Self::save_config(
+            &env,
+            &Config {
+                admin: admin.clone(),
+                treasury,
+                paused: false,
+            },
+        );
         env.storage()
             .instance()
             .set(&DataKey::UsdcContract, &usdc_contract);
         env.storage()
             .instance()
             .set(&DataKey::XlmContract, &xlm_contract);
-        // `DataKey::Paused` is deliberately not written: an absent key reads
-        // as unpaused (Issue #395 - Part 2).
-        env.storage().instance().set(&DataKey::Paused, &false);
 
         // Grant the Admin role to the admin address itself. Without this,
         // the deploying admin (the DataKey::Admin address) would satisfy
@@ -567,12 +624,53 @@ impl Stellar_CardReceiver {
         result
     }
 
+    /// Loads the packed configuration block (Issue #636).
+    ///
+    /// Falls back to the pre-#636 per-key layout (`DataKey::Admin`,
+    /// `DataKey::Treasury`, `DataKey::Paused`) when `DataKey::Config` is
+    /// absent so a live instance survives a WASM upgrade without an
+    /// explicit migration call. The fallback is read-only: nothing is
+    /// rewritten until the next `save_config`.
+    ///
+    /// # Panics
+    /// Panics if called before `init` (neither layout is present).
+    fn load_config(env: &Env) -> Config {
+        if let Some(cfg) = env.storage().instance().get(&DataKey::Config) {
+            return cfg;
+        }
+        // Legacy layout (pre-#636). `Paused` was opt-in: absent meant
+        // unpaused, so `unwrap_or(false)` preserves that.
+        Config {
+            admin: env.storage().instance().get(&DataKey::Admin).unwrap(),
+            treasury: env
+                .storage()
+                .instance()
+                .get(&DataKey::Treasury)
+                .unwrap(),
+            paused: env
+                .storage()
+                .instance()
+                .get::<_, bool>(&DataKey::Paused)
+                .unwrap_or(false),
+        }
+    }
+
+    /// Writes the packed configuration block and retires the legacy
+    /// per-key slots (Issue #636).
+    ///
+    /// Removing `Admin`/`Treasury`/`Paused` shrinks the instance entry on
+    /// the first write after an upgrade, which is when the packing win
+    /// actually lands on-chain.
+    fn save_config(env: &Env, cfg: &Config) {
+        env.storage().instance().set(&DataKey::Config, cfg);
+        env.storage().instance().remove(&DataKey::Admin);
+        env.storage().instance().remove(&DataKey::Treasury);
+        env.storage().instance().remove(&DataKey::Paused);
+    }
+
     /// Returns whether the contract is currently paused.
     fn is_paused(env: &Env) -> bool {
-        env.storage()
-            .instance()
-            .get::<_, bool>(&DataKey::Paused)
-            .unwrap_or(false)
+        Self::load_config(env).paused
     }
 
     /// Returns `true` if `account` is currently blacklisted.
@@ -663,7 +761,9 @@ impl Stellar_CardReceiver {
         if Self::is_paused(&env) {
             return;
         }
-        env.storage().instance().set(&DataKey::Paused, &true);
+        let mut cfg = Self::load_config(&env);
+        cfg.paused = true;
+        Self::save_config(&env, &cfg);
         Self::extend_instance_ttl(&env);
 
         // Emit pause event (Issue #428 - Part 5)
@@ -690,15 +790,17 @@ impl Stellar_CardReceiver {
     /// # Panics
     /// Panics if called before `init`, or if `admin.require_auth()` fails.
     pub fn unpause(env: Env) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let mut cfg = Self::load_config(&env);
+        let admin = cfg.admin.clone();
         admin.require_auth();
         Self::require_not_decommissioned(&env);
-        if !Self::is_paused(&env) {
+        if !cfg.paused {
             return;
         }
-        // Remove rather than store `false`: absent means unpaused (Issue
-        // #395 - Part 2).
-        env.storage().instance().remove(&DataKey::Paused);
+        // Packed flag flips to false (Issue #636); the legacy per-key
+        // representation removed the key entirely to save bytes.
+        cfg.paused = false;
+        Self::save_config(&env, &cfg);
         Self::extend_instance_ttl(&env);
 
         // Emit unpause event (Issue #428 - Part 5)
@@ -867,7 +969,7 @@ impl Stellar_CardReceiver {
         let payment_ledgers = Self::next_payment_rate_limit(&env, &from)?;
         let (_, window_ledgers) = Self::payment_rate_limit(env.clone());
 
-        let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+        let treasury: Address = Self::load_config(&env).treasury;
         let usdc_contract: Address = env
             .storage()
             .instance()
@@ -928,7 +1030,7 @@ impl Stellar_CardReceiver {
         }
         from.require_auth();
 
-        let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+        let treasury: Address = Self::load_config(&env).treasury;
         let usdc_contract: Address = env
             .storage()
             .instance()
@@ -997,7 +1099,7 @@ impl Stellar_CardReceiver {
         let payment_ledgers = Self::next_payment_rate_limit(&env, &from)?;
         let (_, window_ledgers) = Self::payment_rate_limit(env.clone());
 
-        let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+        let treasury: Address = Self::load_config(&env).treasury;
         let xlm_contract: Address = env.storage().instance().get(&DataKey::XlmContract).unwrap();
 
         // Apply discount if the payer has one
@@ -1054,7 +1156,7 @@ impl Stellar_CardReceiver {
         }
         from.require_auth();
 
-        let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+        let treasury: Address = Self::load_config(&env).treasury;
         let xlm_contract: Address = env.storage().instance().get(&DataKey::XlmContract).unwrap();
         let net_amount = Self::apply_discount(&env, &from, amount);
         let transferred = Self::with_reentrancy_guard(&env, || {
@@ -1087,7 +1189,7 @@ impl Stellar_CardReceiver {
     /// "not yet initialized" from a real error should use the
     /// auto-generated `try_treasury` instead.
     pub fn treasury(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::Treasury).unwrap()
+        Self::load_config(&env).treasury
     }
 
     /// Returns the USDC SAC contract address.
@@ -1132,7 +1234,7 @@ impl Stellar_CardReceiver {
     /// # Panics
     /// Panics if called before `init` (see `try_admin` to avoid this).
     pub fn admin(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::Admin).unwrap()
+        Self::load_config(&env).admin
     }
 
     /// Returns whether the contract is currently paused.
@@ -1161,11 +1263,13 @@ impl Stellar_CardReceiver {
     /// # Panics
     /// Panics if called before `init` or if `admin.require_auth()` fails.
     pub fn update_treasury(env: Env, new_treasury: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let mut cfg = Self::load_config(&env);
+        let admin = cfg.admin.clone();
         admin.require_auth();
 
-        let old_treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
-        env.storage().instance().set(&DataKey::Treasury, &new_treasury);
+        let old_treasury = cfg.treasury.clone();
+        cfg.treasury = new_treasury.clone();
+        Self::save_config(&env, &cfg);
         Self::extend_instance_ttl(&env);
 
         // Emit treasury update event
@@ -1194,7 +1298,7 @@ impl Stellar_CardReceiver {
     /// # Panics
     /// Panics if called before `init` or if `admin.require_auth()` fails.
     pub fn update_usdc_contract(env: Env, new_contract: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = Self::load_config(&env).admin;
         admin.require_auth();
 
         let old_contract: Address = env.storage().instance().get(&DataKey::UsdcContract).unwrap();
@@ -1228,7 +1332,7 @@ impl Stellar_CardReceiver {
     /// # Panics
     /// Panics if called before `init` or if `admin.require_auth()` fails.
     pub fn update_xlm_contract(env: Env, new_contract: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = Self::load_config(&env).admin;
         admin.require_auth();
 
         let old_contract: Address = env.storage().instance().get(&DataKey::XlmContract).unwrap();
@@ -1264,7 +1368,7 @@ impl Stellar_CardReceiver {
     /// `admin.require_auth()` fails, or if `new_wasm_hash` does not
     /// correspond to a previously uploaded WASM blob.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = Self::load_config(&env).admin;
         admin.require_auth();
         Self::require_not_decommissioned(&env);
         env.deployer()
@@ -1512,7 +1616,7 @@ impl Stellar_CardReceiver {
     /// are accepted. Shared by `rescue_tokens` and `set_withdraw_limits`
     /// so the rule, and its code, exist once (Issue #392 - Part 1).
     fn has_admin_authority(env: &Env, caller: &Address) -> bool {
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored_admin: Address = Self::load_config(&env).admin;
         *caller == stored_admin || Self::has_role(env.clone(), caller.clone(), Role::Admin)
     }
 
@@ -1596,7 +1700,7 @@ impl Stellar_CardReceiver {
     /// # Panics
     /// Panics if called before `init`, or if either `require_auth()` fails.
     pub fn transfer_admin(env: Env, new_admin: Address) {
-        let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let current_admin: Address = Self::load_config(&env).admin;
         current_admin.require_auth();
         new_admin.require_auth();
         Self::require_not_decommissioned(&env);
@@ -1608,7 +1712,9 @@ impl Stellar_CardReceiver {
         }
         Self::store_role(&env, new_admin.clone(), Role::Admin);
 
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        let mut cfg = Self::load_config(&env);
+        cfg.admin = new_admin.clone();
+        Self::save_config(&env, &cfg);
         Self::extend_instance_ttl(&env);
 
         // Emit admin transfer event (Issue #428 - Part 5)
@@ -1648,7 +1754,7 @@ impl Stellar_CardReceiver {
     /// # Panics
     /// Panics if called before `init`, or if `admin.require_auth()` fails.
     pub fn grant_role(env: Env, address: Address, role: Role) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = Self::load_config(&env).admin;
         admin.require_auth();
         Self::require_not_decommissioned(&env);
 
@@ -1676,7 +1782,7 @@ impl Stellar_CardReceiver {
     /// Emits one `role_granted` event per address whose role actually
     /// changed, matching `grant_role`.
     pub fn grant_roles(env: Env, addresses: Vec<Address>, role: Role) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = Self::load_config(&env).admin;
         admin.require_auth();
         Self::require_not_decommissioned(&env);
 
@@ -1755,7 +1861,7 @@ impl Stellar_CardReceiver {
     /// Revoking a role from an address that never had one is a no-op, not
     /// a panic (see `test_revoke_nonexistent_role_is_noop`).
     pub fn revoke_role(env: Env, address: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = Self::load_config(&env).admin;
         admin.require_auth();
         Self::require_not_decommissioned(&env);
 
@@ -1964,17 +2070,19 @@ impl Stellar_CardReceiver {
     /// Panics if called before `init`, if `admin.require_auth()` fails, if
     /// the contract is already decommissioned, or if a sweep transfer fails.
     pub fn decommission(env: Env, extra_tokens: Vec<Address>) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = Self::load_config(&env).admin;
         admin.require_auth();
         Self::require_not_decommissioned(&env);
 
         // Effects before interactions: lock the contract first so a token
         // callback during the sweep can't reach any live entrypoint.
         env.storage().instance().set(&DataKey::Decommissioned, &true);
-        env.storage().instance().set(&DataKey::Paused, &true);
+        let mut cfg = Self::load_config(&env);
+        cfg.paused = true;
+        Self::save_config(&env, &cfg);
         Self::extend_instance_ttl(&env);
 
-        let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+        let treasury: Address = Self::load_config(&env).treasury;
         let mut tokens: Vec<Address> = Vec::new(&env);
         tokens.push_back(env.storage().instance().get(&DataKey::UsdcContract).unwrap());
         tokens.push_back(env.storage().instance().get(&DataKey::XlmContract).unwrap());
@@ -2035,7 +2143,7 @@ impl Stellar_CardReceiver {
     /// # Panics
     /// Panics if called before `init` (no stored admin yet).
     fn has_authority(env: &Env, caller: &Address, required: Role) -> bool {
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored_admin: Address = Self::load_config(&env).admin;
         *caller == stored_admin || Self::has_role(env.clone(), caller.clone(), required)
     }
 
@@ -7051,11 +7159,16 @@ mod test {
         assert!(f.client().is_paused_view());
     }
 
-    // ── Storage footprint tests (Issue #395 - Part 2) ─────────────────────────
+    // ── Storage footprint tests (Issue #395 - Part 2, Issue #636) ─────────────
 
     fn has_instance_key(f: &Fixture, key: &DataKey) -> bool {
         f.env
             .as_contract(&f.contract_id, || f.env.storage().instance().has(key))
+    }
+
+    fn instance_config(f: &Fixture) -> Option<Config> {
+        f.env
+            .as_contract(&f.contract_id, || f.env.storage().instance().get(&DataKey::Config))
     }
 
     fn daily_withdrawn_slot(f: &Fixture) -> Option<(u64, i128)> {
@@ -7065,23 +7178,94 @@ mod test {
     }
 
     #[test]
-    fn test_init_does_not_store_paused_flag() {
+    fn test_init_packs_config_into_single_slot() {
         let f = Fixture::new();
         f.init();
+        // Issue #636: admin, treasury, and paused live in one packed slot.
+        assert!(has_instance_key(&f, &DataKey::Config));
+        assert!(!has_instance_key(&f, &DataKey::Admin));
+        assert!(!has_instance_key(&f, &DataKey::Treasury));
         assert!(!has_instance_key(&f, &DataKey::Paused));
+
+        let cfg = instance_config(&f).expect("Config slot present after init");
+        assert_eq!(cfg.admin, f.admin);
+        assert_eq!(cfg.treasury, f.treasury);
+        assert!(!cfg.paused);
         assert!(!f.client().is_paused_view());
     }
 
     #[test]
-    fn test_unpause_removes_paused_flag() {
+    fn test_pause_and_unpause_write_packed_config() {
         let f = Fixture::new();
         f.init();
         f.client().pause(&f.admin);
-        assert!(has_instance_key(&f, &DataKey::Paused));
+        let cfg = instance_config(&f).unwrap();
+        assert!(cfg.paused);
+        assert!(f.client().is_paused_view());
+        // The legacy Paused key is never (re)created.
+        assert!(!has_instance_key(&f, &DataKey::Paused));
 
         f.client().unpause();
-        assert!(!has_instance_key(&f, &DataKey::Paused));
+        let cfg = instance_config(&f).unwrap();
+        assert!(!cfg.paused);
         assert!(!f.client().is_paused_view());
+    }
+
+    #[test]
+    fn test_config_reads_legacy_layout_until_first_write() {
+        // Simulate a pre-#636 instance that still holds the per-key layout,
+        // then verify the packed reader falls back and the first write
+        // migrates (retires the legacy keys).
+        let f = Fixture::new();
+        f.init();
+        // Downgrade to the legacy layout.
+        f.env.as_contract(&f.contract_id, || {
+            let cfg = f.env.storage().instance().get::<_, Config>(&DataKey::Config).unwrap();
+            f.env.storage().instance().set(&DataKey::Admin, &cfg.admin);
+            f.env
+                .storage()
+                .instance()
+                .set(&DataKey::Treasury, &cfg.treasury);
+            f.env
+                .storage()
+                .instance()
+                .set(&DataKey::Paused, &cfg.paused);
+            f.env.storage().instance().remove(&DataKey::Config);
+        });
+        assert!(!has_instance_key(&f, &DataKey::Config));
+        assert!(has_instance_key(&f, &DataKey::Admin));
+
+        // Reads fall back to the legacy keys.
+        assert_eq!(f.client().admin(), f.admin);
+        assert_eq!(f.client().treasury(), f.treasury);
+        assert!(!f.client().is_paused_view());
+
+        // A write migrates: packed slot present, legacy keys gone.
+        f.client().pause(&f.admin);
+        assert!(has_instance_key(&f, &DataKey::Config));
+        assert!(!has_instance_key(&f, &DataKey::Admin));
+        assert!(!has_instance_key(&f, &DataKey::Treasury));
+        assert!(!has_instance_key(&f, &DataKey::Paused));
+        let cfg = instance_config(&f).unwrap();
+        assert_eq!(cfg.admin, f.admin);
+        assert_eq!(cfg.treasury, f.treasury);
+        assert!(cfg.paused);
+    }
+
+    #[test]
+    fn test_update_treasury_and_transfer_admin_write_packed_config() {
+        let f = Fixture::new();
+        f.init();
+        let new_treasury = Address::generate(&f.env);
+        let new_admin = Address::generate(&f.env);
+        f.client().update_treasury(&new_treasury);
+        f.client().transfer_admin(&new_admin);
+
+        let cfg = instance_config(&f).unwrap();
+        assert_eq!(cfg.treasury, new_treasury);
+        assert_eq!(cfg.admin, new_admin);
+        assert!(!has_instance_key(&f, &DataKey::Admin));
+        assert!(!has_instance_key(&f, &DataKey::Treasury));
     }
 
     #[test]
