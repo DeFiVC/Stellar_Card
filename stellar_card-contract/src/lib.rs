@@ -63,9 +63,9 @@
 //! | `treasury_updated`       | `old_treasury`, `new_treasury`                | `admin`                                   |
 //! | `token_contract_updated` | `asset_symbol`, `old_contract`, `new_contract`| `admin`                                   |
 //! | `admin_transferred`      | `old_admin`, `new_admin`                      | `()`                                      |
-//! | `role_granted`           | `address`                                     | `role`                                    |
-//! | `role_revoked`           | `address`                                     | `()`                                      |
-//! | `role_renounced`         | `caller`                                      | `()`                                      |
+//! | `role_granted`           | `address`, `role`                             | `role`                                    |
+//! | `role_revoked`           | `address`, `role`                             | `()`                                      |
+//! | `role_renounced`         | `caller`, `role`                              | `()`                                      |
 //!
 //! `transfer_admin` also moves the `Admin` role, so it is preceded by a
 //! `role_revoked` for the old admin (when it held `Admin`) and a
@@ -1641,9 +1641,9 @@ impl Stellar_CardReceiver {
     /// re-granting a role to the same address repeatedly doesn't re-bill
     /// rent on every call.
     ///
-    /// # Events (Issue #428 - Part 5)
-    /// Emits: topics=[Symbol("role_granted"), address], value=role — only
-    /// when the address's stored role actually changes (Issue #398 - Part 2).
+    /// # Events (Issue #428 - Part 5, Issue #635)
+    /// Emits: topics=[Symbol("role_granted"), address, role], value=role —
+    /// only when the address's stored role actually changes (Issue #398 - Part 2).
     ///
     /// # Panics
     /// Panics if called before `init`, or if `admin.require_auth()` fails.
@@ -1708,9 +1708,12 @@ impl Stellar_CardReceiver {
         Self::extend_role_ttl(env, &key);
 
         if previous != Some(role) {
-            // Emit role granted event (Issue #428 - Part 5)
+            // Emit role granted event (Issue #428 - Part 5, Issue #635).
+            // Topics carry the role so indexers can filter grants by role
+            // without decoding the data payload; the data payload keeps the
+            // role as well for existing consumers.
             env.events()
-                .publish((Symbol::new(env, "role_granted"), address), role);
+                .publish((Symbol::new(env, "role_granted"), address, role), role);
         }
     }
 
@@ -1723,11 +1726,15 @@ impl Stellar_CardReceiver {
     /// held no role.
     fn remove_role(env: &Env, address: Address, event: &str) -> bool {
         let key = DataKey::UserRole(address.clone());
-        if !env.storage().persistent().has(&key) {
-            return false;
-        }
+        let role: Role = match env.storage().persistent().get(&key) {
+            Some(r) => r,
+            None => return false,
+        };
         env.storage().persistent().remove(&key);
-        env.events().publish((Symbol::new(env, event), address), ());
+        // Issue #635: the revoked role is a topic so the on-chain audit
+        // trail records which role was taken away, not just that one was.
+        env.events()
+            .publish((Symbol::new(env, event), address, role), ());
         true
     }
 
@@ -1740,8 +1747,8 @@ impl Stellar_CardReceiver {
     /// # Authorization (Issue #426 - Part 5 - Complete NatSpec)
     /// Only the admin can call this function.
     ///
-    /// # Events (Issue #428 - Part 5)
-    /// Emits: topics=[Symbol("role_revoked"), address], value=()
+    /// # Events (Issue #428 - Part 5, Issue #635)
+    /// Emits: topics=[Symbol("role_revoked"), address, role], value=()
     ///
     /// # Panics
     /// Panics if called before `init`, or if `admin.require_auth()` fails.
@@ -5357,9 +5364,15 @@ mod test {
         let user = Address::generate(&f.env);
 
         f.client().grant_role(&user, &Role::Viewer);
-        let (_, data) = single_contract_event(&f, "role_granted");
+        let (topics, data) = single_contract_event(&f, "role_granted");
         let role: Role = data.try_into_val(&f.env).unwrap();
         assert_eq!(role, Role::Viewer);
+        // Issue #635: topics are (name, account, role).
+        assert_eq!(topics.len(), 3);
+        let account: Address = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
+        assert_eq!(account, user);
+        let topic_role: Role = topics.get(2).unwrap().try_into_val(&f.env).unwrap();
+        assert_eq!(topic_role, Role::Viewer);
 
         // Same role again: nothing changed, so no event.
         f.client().grant_role(&user, &Role::Viewer);
@@ -5371,9 +5384,11 @@ mod test {
 
         // A different role is a real change and is reported.
         f.client().grant_role(&user, &Role::Operator);
-        let (_, data) = single_contract_event(&f, "role_granted");
+        let (topics, data) = single_contract_event(&f, "role_granted");
         let role: Role = data.try_into_val(&f.env).unwrap();
         assert_eq!(role, Role::Operator);
+        let topic_role: Role = topics.get(2).unwrap().try_into_val(&f.env).unwrap();
+        assert_eq!(topic_role, Role::Operator);
     }
 
     #[test]
@@ -5416,8 +5431,12 @@ mod test {
 
         f.client().revoke_role(&user);
         let (topics, _) = single_contract_event(&f, "role_revoked");
+        // Issue #635: topics are (name, account, role).
+        assert_eq!(topics.len(), 3);
         let revoked: Address = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
         assert_eq!(revoked, user);
+        let revoked_role: Role = topics.get(2).unwrap().try_into_val(&f.env).unwrap();
+        assert_eq!(revoked_role, Role::Viewer);
 
         f.client().revoke_role(&user);
         assert_eq!(
